@@ -235,8 +235,41 @@
     addPending({ op: 'meta', text: text });
   }
 
+  // ---------- session persistence (survives a page refresh) ----------
+  function saveState() {
+    try {
+      var keep = state.pending.filter(function (p) { return !p.file; }).map(function (p) {
+        return {
+          id: p.id, op: p.op, path: p.path, newPath: p.newPath, sha: p.sha,
+          text: p.text, size: p.size, note: p.note
+        };
+      });
+      sessionStorage.setItem('jbrm_state', JSON.stringify({
+        pending: keep, meta: state.meta, metaDirty: state.metaDirty,
+        commitError: state.commitError
+      }));
+    } catch (e) { /* storage unavailable */ }
+  }
+  function restoreState() {
+    try {
+      var raw = sessionStorage.getItem('jbrm_state');
+      if (!raw) return;
+      var s = JSON.parse(raw);
+      if (s.pending && s.pending.length) state.pending = s.pending;
+      if (s.meta && s.meta.plugins) {
+        state.meta = s.meta;
+        state.metaDirty = !!s.metaDirty;
+      }
+      state.commitError = s.commitError || '';
+      seq = state.pending.reduce(function (m, p) {
+        return Math.max(m, Number(p.id) || 0);
+      }, 0);
+    } catch (e) { /* ignore */ }
+  }
+
   // ---------- rendering ----------
   function render() {
+    saveState();
     var v = state.view;
     $('view-dirs').hidden = v !== 'dirs';
     $('view-plugins').hidden = v !== 'plugins';
@@ -801,6 +834,7 @@
   $('dialog-input').onkeydown = function (e) { if (e.key === 'Enter') $('dialog-ok').click(); };
   $('dialog').onclick = function (e) { if (e.target === $('dialog')) closeDialog(); };
 
+  restoreState();
   var saved = localStorage.getItem('jbrm_token') || sessionStorage.getItem('jbrm_token');
   if (saved) { $('token').value = saved; connect(); }
 })();
