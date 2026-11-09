@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>越狱源管理台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>越狱源管理台</h1>
+    <p class="sub">管理 <code id="repo-name">ynyy0/ynyy0.github.io</code> 的插件与目录，所有改动合并为一次原子提交</p>
+  </div>
+  <div id="who" class="who"></div>
+</header>
+
+<section class="card" id="auth-card">
+  <h2>连接 GitHub</h2>
+  <p class="hint">需要一个对 <b>ynyy0/ynyy0.github.io</b> 有 <b>Contents: Read &amp; Write</b> 权限的 Personal Access Token。Token 只保存在你本机浏览器，不会写进仓库或发送到第三方。</p>
+  <div class="row">
+    <input type="password" id="token" class="grow" placeholder="github_pat_… 或 ghp_…" autocomplete="off" spellcheck="false">
+    <button id="btn-connect" class="primary">连接</button>
+  </div>
+  <div class="row small">
+    <label><input type="checkbox" id="remember" checked> 记住这台设备</label>
+    <span class="grow"></span>
+    <a href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener">生成 fine-grained PAT ↗</a>
+  </div>
+  <div id="auth-msg" class="msg"></div>
+</section>
+
+<main id="app" hidden>
+  <div class="card toolbar">
+    <button id="btn-refresh">刷新仓库</button>
+    <span id="tree-summary" class="hint"></span>
+    <span class="grow"></span>
+    <button id="btn-clear">清空待提交</button>
+    <button id="btn-commit" class="primary">提交更改（<span id="pending-count">0</span>）</button>
+  </div>
+
+  <div class="grid">
+    <div class="col">
+      <section class="card">
+        <h2>上传文件</h2>
+        <div id="drop" class="drop">拖拽 <b>.deb</b> / 图片到这里，或点击选择文件</div>
+        <input type="file" id="file-input" multiple hidden>
+        <div class="row small">
+          <label class="grow">目标目录
+            <select id="upload-dir" class="full"></select>
+          </label>
+          <label class="grow">或新建目录
+            <input id="new-dir" class="full" placeholder="例如：beta">
+          </label>
+        </div>
+        <div id="upload-list" class="list"></div>
+        <p class="hint">单个文件建议 ≤ 50 MB。上传 <code>.deb</code> 请放 <code>debs/</code>，图标请放 <code>icons/</code> 并命名为 <code>{包名}.png</code>。</p>
+      </section>
+
+      <section class="card">
+        <h2>重命名目录</h2>
+        <div class="row small">
+          <select id="rename-old" class="grow"></select>
+          <span>→</span>
+          <input id="rename-new" class="grow" placeholder="新目录名">
+          <button id="btn-rename">加入待提交</button>
+        </div>
+        <p class="hint">会移动该目录下全部文件。重命名 <code>debs/</code> 会让 APT 索引扫不到插件，请谨慎。</p>
+      </section>
+
+      <section class="card">
+        <h2>移动插件</h2>
+        <div class="row small">
+          <select id="move-file" class="grow"></select>
+          <span>→</span>
+          <select id="move-dir" class="grow"></select>
+          <button id="btn-move">加入待提交</button>
+        </div>
+        <label class="small"><input type="checkbox" id="move-icon" checked> 同时移动同目录下的同名图标（若存在）</label>
+        <p class="hint">移出 <code>debs/</code> 的包不会被 <code>release.yml</code> 收录。</p>
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card">
+        <h2>仓库文件 <span id="file-count" class="badge"></span></h2>
+        <div class="row small">
+          <input id="filter" class="grow" placeholder="筛选文件名…">
+        </div>
+        <div id="tree" class="tree"></div>
+      </section>
+
+      <section class="card">
+        <h2>待提交变更 <span id="pending-count2" class="badge"></span></h2>
+        <div id="pending" class="list"></div>
+        <div id="commit-msg" class="msg"></div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<div id="toast" class="toast"></div>
+<script src="app.js"></script>
+</body>
+</html>
