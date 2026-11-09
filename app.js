@@ -24,7 +24,8 @@
     pending: [],
     commitError: '',
     view: 'dirs',
-    dirFilter: null
+    dirFilter: null,
+    catFilter: null
   };
 
   // ---------- helpers ----------
@@ -275,12 +276,14 @@
     $('view-plugins').hidden = v !== 'plugins';
     $('view-pending').hidden = v !== 'pending';
     $('view-me').hidden = v !== 'me';
-    $('nav-back').hidden = !(v === 'plugins' && state.dirFilter);
+    $('nav-back').hidden = !(v === 'plugins' && (state.dirFilter || state.catFilter));
     $('nav-add').hidden = (v === 'me' || v === 'pending');
 
     var titles = { dirs: '目录', pending: '待提交', me: '连接' };
     $('nav-title').textContent = v === 'plugins'
-      ? (state.dirFilter || '全部插件') : titles[v];
+      ? (state.dirFilter ||
+         (state.catFilter === '__all__' ? '全部插件' : (state.catFilter || '分类')))
+      : titles[v];
     $('nav-add').textContent = '+';
 
     var searchable = (v === 'dirs' || v === 'plugins');
@@ -328,12 +331,51 @@
     $('view-dirs').innerHTML = html;
   }
 
+  function sectionStats() {
+    var map = {};
+    state.plugins.forEach(function (p) {
+      var s = p.section || '未分类';
+      map[s] = (map[s] || 0) + 1;
+    });
+    return map;
+  }
+
+  function renderCats(q) {
+    var stats = sectionStats();
+    var names = Object.keys(stats).sort(function (a, b) {
+      if (a === '未分类') return 1;
+      if (b === '未分类') return -1;
+      return stats[b] - stats[a];
+    }).filter(function (s) { return !q || s.toLowerCase().indexOf(q) >= 0; });
+
+    var html = '<div class="section-title">分类 · ' + names.length + ' 个</div><div class="list-card">';
+    html += '<div class="cell" data-cat="__all__"><div class="cell-main">' +
+      '<div class="cell-name">全部插件</div>' +
+      '<div class="cell-sub">所有分类 · 共 ' + state.plugins.length + ' 个</div></div>' +
+      '<span class="cell-count">' + state.plugins.length + '</span><span class="chev">›</span></div>';
+    names.forEach(function (s) {
+      html += '<div class="cell" data-cat="' + esc(s) + '">' +
+        '<div class="cell-main"><div class="cell-name">' + esc(s) + '</div>' +
+        '<div class="cell-sub">' + stats[s] + ' 个插件</div></div>' +
+        '<span class="cell-count">' + stats[s] + '</span><span class="chev">›</span></div>';
+    });
+    html += '</div>';
+    if (!names.length) html += '<div class="empty">' + (q ? '没有匹配的分类' : '还没有插件') + '</div>';
+    html += '<div class="card"><b>提示</b><p class="hint">分类来自源仓库 APT 索引的 Section 字段；' +
+      '点「全部插件」看所有插件，点分类看对应插件。</p></div>';
+    $('view-plugins').innerHTML = html;
+  }
+
   function renderPlugins() {
     var q = $('search').value.trim().toLowerCase();
-    var list = pluginsIn(state.dirFilter).filter(function (p) {
+    if (!state.catFilter) return renderCats(q);
+    var base = state.dirFilter ? pluginsIn(state.dirFilter) : state.plugins;
+    var list = base.filter(function (p) {
+      if (state.catFilter !== '__all__' && (p.section || '未分类') !== state.catFilter) return false;
       return !q || (p.name + ' ' + p.pkg + ' ' + p.desc).toLowerCase().indexOf(q) >= 0;
     });
-    var html = '<div class="section-title">' + (state.dirFilter || '全部插件') + ' · ' + list.length + ' 个插件</div>';
+    var html = '<div class="section-title">' + esc(state.catFilter === '__all__'
+      ? (state.dirFilter || '全部插件') : state.catFilter) + ' · ' + list.length + ' 个插件</div>';
     if (!list.length) {
       html += '<div class="empty">这里还没有插件</div>';
     } else {
@@ -735,6 +777,7 @@
       setMsg('login-msg', '');
       state.view = 'dirs';
       state.dirFilter = null;
+      state.catFilter = null;
       await loadAll();
       render();
       toast('已连接：' + u.login);
@@ -765,7 +808,7 @@
   document.querySelectorAll('.tab').forEach(function (t) {
     t.onclick = function () {
       state.view = t.getAttribute('data-tab');
-      if (state.view === 'plugins' && !state.dirFilter) { /* 全部插件 */ }
+      if (state.view === 'plugins') { state.dirFilter = null; state.catFilter = null; }
       $('search').value = '';
       render();
       window.scrollTo(0, 0);
@@ -773,7 +816,13 @@
   });
 
   $('nav-back').onclick = function () {
-    state.view = 'dirs'; state.dirFilter = null;
+    if (state.dirFilter) {
+      state.dirFilter = null; state.catFilter = null; state.view = 'dirs';
+    } else if (state.catFilter) {
+      state.catFilter = null; // 回到分类列表
+    } else {
+      state.view = 'dirs';
+    }
     $('search').value = ''; render();
   };
   $('nav-add').onclick = function () {
@@ -806,6 +855,15 @@
   };
 
   $('view-plugins').onclick = function (e) {
+    var catCell = e.target.closest('[data-cat]');
+    if (catCell) {
+      state.catFilter = catCell.getAttribute('data-cat');
+      state.dirFilter = null;
+      $('search').value = '';
+      render();
+      window.scrollTo(0, 0);
+      return;
+    }
     var path = e.target.getAttribute('data-plugin');
     if (path) pluginMenu(path);
   };
