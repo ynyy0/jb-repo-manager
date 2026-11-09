@@ -20,7 +20,7 @@
     iconPreviews: {},    // lowercase path -> 本地预览 blob URL（未提交）
     index: { byFilename: {}, byPackage: {} },
     meta: { plugins: {} },                       // 仓库基线（loadAll 总是刷新）
-    edits: { plugins: {}, categories: null, useSourceIcon: null }, // 本地未提交的改动
+    edits: { plugins: {}, categories: null }, // 本地未提交的改动
     _eff: null,                                  // 合并后的视图缓存
     plugins: [],
     pending: [],
@@ -162,19 +162,14 @@
     });
     if (edits && edits.categories != null) out.categories = edits.categories.slice();
     else if (base && base.categories) out.categories = base.categories.slice();
-    if (edits && edits.useSourceIcon !== null && edits.useSourceIcon !== undefined) {
-      out.useSourceIcon = !!edits.useSourceIcon;
-    } else if (base && base.useSourceIcon !== undefined) {
-      out.useSourceIcon = !!base.useSourceIcon;
-    }
     return out;
   }
   function effMeta() { return state._eff || mergeMeta(state.meta, state.edits); }
   function hasEdits() {
     return Object.keys(state.edits.plugins || {}).length > 0 ||
-      state.edits.categories !== null || state.edits.useSourceIcon !== null;
+      state.edits.categories !== null;
   }
-  function emptyEdits() { return { plugins: {}, categories: null, useSourceIcon: null }; }
+  function emptyEdits() { return { plugins: {}, categories: null }; }
   function sourceIconUrl() {
     // 用仓库里 CydiaIcon.png 的 blob sha 做版本号，换源图标后浏览器不会拿旧缓存
     var f = state.files.find(function (x) { return x.path === 'CydiaIcon.png'; });
@@ -237,7 +232,6 @@
   function rebuild() {
     state._eff = mergeMeta(state.meta, state.edits);
     var meta = state._eff.plugins || {};
-    var useSource = !!state._eff.useSourceIcon;
     var iconIndex = state.iconIndex;
     var previews = state.iconPreviews;
     state.plugins = state.files.filter(function (f) {
@@ -254,8 +248,8 @@
         (info.Icon && /^https?:/.test(info.Icon) ? info.Icon : 'CydiaIcon.png'));
       var fallbackIcon = info.Icon && /^https?:/.test(info.Icon) ? info.Icon : 'CydiaIcon.png';
       var url;
-      if (useSource || icon === SOURCE_ICON) {
-        // 全局设置或单个插件「使用源图标」
+      if (icon === SOURCE_ICON) {
+        // 单个插件设置了「使用源图标」
         url = sourceIconUrl();
       } else if (localIcon && previews[localIcon.toLowerCase()]) {
         url = previews[localIcon.toLowerCase()];
@@ -405,8 +399,7 @@
       if (s.edits) {
         state.edits = {
           plugins: s.edits.plugins || {},
-          categories: s.edits.categories != null ? s.edits.categories : null,
-          useSourceIcon: s.edits.useSourceIcon != null ? !!s.edits.useSourceIcon : null
+          categories: s.edits.categories != null ? s.edits.categories : null
         };
       }
       state.commitError = s.commitError || '';
@@ -558,7 +551,8 @@
     }
     if (!q && !cur) {
       html += '<div class="card"><b>提示</b><p class="hint">点目录行进入子目录；' +
-        '点 ⋯ 可重命名 / 删除目录、在此上传插件。进入 icons/ 可查看全部图标。</p></div>';
+        '点 ⋯ 可重命名 / 删除目录、上传文件到此处；右上角 + 可新建目录或上传任意文件。' +
+        '进入 icons/ 可查看全部图标。</p></div>';
     }
     $('view-dirs').innerHTML = html;
   }
@@ -681,27 +675,15 @@
       '<button id="btn-selftest" class="btn block" style="margin-top:10px">权限自检（查为什么提交失败）</button>' +
       '<button id="btn-clearcache" class="btn block" style="margin-top:10px">清除本地缓存</button>' +
       '<div id="selftest-result"></div></div>' +
-      '<div class="card"><b>显示设置</b><p class="hint">' +
-      '开启「使用源图标」后，全部插件统一显示源图标 <code>CydiaIcon.png</code>，' +
-      '源索引里的 Icon 也会一起替换；关闭后恢复各自图标。没有专属图标的插件本来就会显示源图标。' +
-      '改动需提交后才生效。</p>' +
-      '<button id="btn-sourceicon" class="btn block ' +
-      (effMeta().useSourceIcon ? 'primary' : '') + '" style="margin-top:12px">使用源图标：' +
-      (effMeta().useSourceIcon ? '已开启（点此关闭）' : '已关闭（点此开启）') + '</button></div>' +
       '<div class="card"><b>使用说明</b><p class="hint">' +
       '① 目录页逐级进入子目录，索引 / Release / 页面等文件全部列出，点文件可查看，⋯ 可删除；<br>' +
-      '② 全部插件页是分类目录，+ 添加目录，分类 ⋯ 可重命名 / 删除；<br>' +
-      '③ 插件 ⋯ 可改名、改图标、使用源图标、移动到…（选分类或仓库目录）、删除；<br>' +
-      '④ 所有改动先进入「待提交」，提交后还需 2-5 分钟部署才会在源里生效；<br>' +
-      '⑤ 改图标存成 <code>icons/包标识符.png</code>，图标链接自带版本号，换图后客户端不会再用旧缓存。</p></div>' +
+      '② 目录页或子页右上角 + 可新建目录或上传任意文件，目录 ⋯ 里的「上传文件到此处」同样不限类型；<br>' +
+      '③ 全部插件页是分类目录，+ 添加目录，分类 ⋯ 可重命名 / 删除；<br>' +
+      '④ 插件 ⋯ 可改名、改图标、使用源图标（只把这一个插件换成 CydiaIcon.png）、移动到…、删除；<br>' +
+      '⑤ 所有改动先进入「待提交」，提交后还需 2-5 分钟部署才会在源里生效；<br>' +
+      '⑥ 改图标存成 <code>icons/包标识符.png</code>，图标链接自带版本号，换图后客户端不会再用旧缓存。</p></div>' +
       '<div class="card"><b>关于 Token</b><p class="hint">只保存在本机浏览器，直发 api.github.com，' +
       '不写入仓库、不经过第三方。可随时「断开」清除。</p></div>';
-    $('btn-sourceicon').onclick = function () {
-      var cur = !!effMeta().useSourceIcon;
-      state.edits.useSourceIcon = !cur;
-      noteMetaOnly('设置：使用源图标 ' + (!cur ? '开' : '关'));
-      toast('已' + (!cur ? '开启' : '关闭') + '「使用源图标」，请点提交');
-    };
     $('btn-refresh2').onclick = function () {
       loadAll().then(function () { toast('已重新读取仓库最新状态'); })
         .catch(function (e) { toast('刷新失败：' + e.message, true); });
@@ -976,7 +958,7 @@
           toast('已加入 ' + affected.length + ' 个移动，请点提交');
         });
       } },
-      { label: '在此上传插件', icon: '↑', fn: function () { uploadTo(d, null); } },
+      { label: '上传文件到此处', icon: '↑', fn: function () { uploadAnyFiles(d); } },
       { label: '删除目录', icon: '✕', danger: true, fn: function () {
         var affected = state.files.filter(function (f) { return f.path.indexOf(d + '/') === 0; });
         if (!affected.length) return toast('该目录下没有文件', true);
@@ -995,6 +977,29 @@
       } }
     ];
     openSheet(d + '/', actions);
+  }
+
+  // 上传任意类型文件到指定目录（不限扩展名）
+  function uploadAnyFiles(dir) {
+    var input = $('file-any');
+    input.value = '';
+    input.onchange = function (e) {
+      var files = Array.prototype.slice.call(e.target.files || []);
+      if (!files.length) return;
+      var skipped = 0, added = 0;
+      files.forEach(function (f) {
+        if (f.size > MAX_BYTES) { skipped++; return; }
+        var name = String(f.name || 'file').replace(/[\\/]/g, '_');
+        addPending({
+          op: 'add', path: (dir ? dir + '/' : '') + name, file: f,
+          size: f.size, note: '上传文件'
+        });
+        added++;
+      });
+      if (skipped) toast(skipped + ' 个文件超过 50 MB 已跳过', true);
+      else toast('已加入 ' + added + ' 个文件到 ' + (dir || '仓库根目录') + '，请点提交');
+    };
+    input.click();
   }
 
   function uploadTo(dir, cat) {
@@ -1205,15 +1210,22 @@
     if (state.view === 'pending') {
       state.pending = []; state.edits = emptyEdits(); rebuild(); render(); toast('已清空');
     } else if (state.view === 'dirs') {
-      openDialog('添加目录', '', state.navDir
-        ? '在 ' + state.navDir + '/ 下新建目录（需提交才生效）' : '在仓库根目录下新建目录（需提交才生效）', function (v) {
-        var d = cleanDir(v);
-        if (!validDir(d)) return toast('目录名不合法', true);
-        var full = (state.navDir ? state.navDir + '/' : '') + d;
-        if (allDirs().indexOf(full) >= 0) return toast('目录已存在', true);
-        addPending({ op: 'add', path: full + '/.gitkeep', text: '\n', note: '新建目录' });
-        toast('已加入待提交，请点提交');
-      });
+      var cur = state.navDir;
+      openSheet('添加到 ' + (cur || '仓库根目录'), [
+        { label: '上传文件（不限类型）', icon: '↑', fn: function () { uploadAnyFiles(cur); } },
+        { label: '添加目录', icon: '+', fn: function () {
+          openDialog('添加目录', '', cur
+            ? '在 ' + cur + '/ 下新建目录（需提交才生效）'
+            : '在仓库根目录下新建目录（需提交才生效）', function (v) {
+            var d = cleanDir(v);
+            if (!validDir(d)) return toast('目录名不合法', true);
+            var full = (cur ? cur + '/' : '') + d;
+            if (allDirs().indexOf(full) >= 0) return toast('目录已存在', true);
+            addPending({ op: 'add', path: full + '/.gitkeep', text: '\n', note: '新建目录' });
+            toast('已加入待提交，请点提交');
+          });
+        } }
+      ], '文件会上传到 ' + (cur || '仓库根目录') + '/，任意类型都可以；上传后仍需提交。');
     } else if (state.view === 'plugins') {
       if (!state.catFilter) return addCategory();
       if (state.catFilter === '__all__') return uploadTo('debs', '未分类');
