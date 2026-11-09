@@ -122,3 +122,15 @@ a{color:var(--acc)}
 .stat div{flex:1;background:#fff;border:1px solid var(--bd);border-radius:12px;padding:12px;text-align:center}
 .stat b{display:block;font-size:19px;color:var(--acc)}
 .stat span{font-size:11px;color:var(--mut)}
+/* ---------- 提交失败 / 权限自检 ---------- */
+.err-card{border-color:#f4c9c6;background:#fffafa}
+.err-text{color:var(--danger);font-size:13px;line-height:1.55}
+.linkbtn{display:flex;align-items:center;justify-content:center;text-decoration:none;color:var(--acc)}
+.st-row{display:flex;align-items:flex-start;gap:10px;padding:8px 0;border-top:1px solid #eff1f4;font-size:12px}
+.st-row:first-child{border-top:0}
+.st-row b{width:18px;text-align:center;flex:0 0 auto}
+.st-row.ok b{color:var(--ok)}
+.st-row.no b{color:var(--danger)}
+.st-row span{flex:1;word-break:break-all}
+.st-row small{display:block;color:var(--danger);font-size:11px;margin-top:3px}
+#selftest-result{margin-top:12px}

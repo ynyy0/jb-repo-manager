@@ -39,6 +39,18 @@
 
 Token 只在本机浏览器使用，直发 `api.github.com`，不写进仓库、不经过第三方。
 
+## 提交失败：`403 Resource not accessible by personal access token`
+
+含义是 **Token 能读、不能写**（插件列表能加载，一点提交就 403）。修复：
+
+- **fine-grained PAT**：Resource owner 必须是 `ynyy0`；Repository access 选 **Only select repositories** 并勾选 **`ynyy0.github.io`**（不是 `jb-repo-manager`）；Repository permissions 里 **Contents = Read and Write**
+- **classic PAT**：直接勾 `repo` scope 最省事
+- 生成后回「连接」页点 **断开**，再粘贴新 Token 重新连接（旧 Token 存在浏览器里，不换不会生效）；待提交改动不会丢，回来重新点提交即可
+
+「连接」页和提交失败卡片里都有 **权限自检** 按钮，会逐项测试身份 / 仓库可见 / 读分支 / 写 blob，直接指出缺哪一项。写 blob 用的是一个空内容 blob，不会改动仓库。
+
+其他错误码：401 = Token 无效或过期；409 = 期间有自动索引提交，点「刷新仓库」后重试。
+
 ## 数据与限制
 
 - 插件信息来源：仓库文件树（所有 `.deb`）＋ `Packages` 索引（名称、版本、描述、分类）＋ `repo-meta.json`（覆盖），图标走 `raw.githubusercontent.com` 实时显示

@@ -22,6 +22,7 @@
     dirs: [],
     clipboard: null,
     pending: [],
+    commitError: '',
     view: 'dirs',
     dirFilter: null
   };
@@ -100,6 +101,16 @@
     if (!r.ok) {
       var detail = '';
       try { var j = await r.json(); detail = j.message || ''; } catch (e) { /* ignore */ }
+      if (r.status === 403 && /Resource not accessible by personal access token/i.test(detail)) {
+        throw new Error('PAT 权限不足：需要对 ynyy0.github.io 的 Contents: Read and Write（写权限）。' +
+          '请重新生成 Token，然后在本页「连接」里断开并重新粘贴。');
+      }
+      if (r.status === 401) {
+        throw new Error('Token 无效或已过期，请重新生成并重新连接。');
+      }
+      if (r.status === 409) {
+        throw new Error('提交冲突：期间仓库有新提交（通常是自动索引）。请点「刷新仓库」后重试。');
+      }
       throw new Error(r.status + ' ' + r.statusText + (detail ? ' — ' + detail : ''));
     }
     return r.status === 204 ? null : r.json();
@@ -148,17 +159,19 @@
       if (r.ok) state.index = parseIndex(await r.text());
     } catch (e) { /* 索引不可用时退化为文件名显示 */ }
 
-    var metaFile = state.files.find(function (f) { return f.path === 'repo-meta.json'; });
-    if (metaFile) {
-      try {
-        var blob = await gh(repoPath('/git/blobs/' + metaFile.sha));
-        var parsed = JSON.parse(b64ToUtf8(blob.content));
-        state.meta = parsed && parsed.plugins ? parsed : { plugins: {} };
-      } catch (e) { state.meta = { plugins: {} }; }
-    } else {
-      state.meta = { plugins: {} };
+    // 有未提交的改名时保留内存里的元数据，避免「断开重连」把它冲掉
+    if (!state.metaDirty) {
+      var metaFile = state.files.find(function (f) { return f.path === 'repo-meta.json'; });
+      if (metaFile) {
+        try {
+          var blob = await gh(repoPath('/git/blobs/' + metaFile.sha));
+          var parsed = JSON.parse(b64ToUtf8(blob.content));
+          state.meta = parsed && parsed.plugins ? parsed : { plugins: {} };
+        } catch (e) { state.meta = { plugins: {} }; }
+      } else {
+        state.meta = { plugins: {} };
+      }
     }
-    state.metaDirty = false;
     rebuild();
     toast('已加载 ' + state.plugins.length + ' 个插件');
   }
@@ -326,6 +339,18 @@
       });
     }
     html += '</div>';
+    if (state.commitError) {
+      html += '<div class="card err-card"><b>提交失败</b>' +
+        '<p class="hint err-text">' + esc(state.commitError) + '</p>' +
+        '<p class="hint"><b>怎么修</b><br>' +
+        '① GitHub → Settings → Developer settings → Personal access tokens<br>' +
+        '② 新建 Token：<b>fine-grained</b> 要选 Resource owner <code>ynyy0</code>、仓库 <code>ynyy0.github.io</code>、权限 <b>Contents: Read and Write</b>；<b>classic</b> 直接勾 <code>repo</code><br>' +
+        '③ 回「连接」页 → 断开 → 粘贴新 Token 重新连接<br>' +
+        '④ 回来重新提交（待提交的改动不会丢）</p>' +
+        '<div class="row" style="margin-top:12px">' +
+        '<a class="btn grow linkbtn" href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">生成新 PAT ↗</a>' +
+        '<button id="btn-selftest2" class="btn grow">权限自检</button></div></div>';
+    }
     html += '<div class="commit-bar"><button id="btn-commit" class="btn primary block"' +
       (state.pending.length ? '' : ' disabled') + '>提交更改（' + state.pending.length + '）</button>' +
       '<button id="btn-clear" class="btn block"' + (state.pending.length ? '' : ' disabled') +
@@ -336,6 +361,11 @@
     $('btn-clear').onclick = function () {
       state.pending = []; rebuild(); render(); toast('已清空');
     };
+    if ($('btn-selftest2')) {
+      $('btn-selftest2').onclick = function () {
+        state.view = 'me'; render(); runSelfTest(); window.scrollTo(0, 0);
+      };
+    }
   }
 
   function renderMe() {
@@ -343,7 +373,9 @@
       '<div class="card"><b>当前连接</b><p class="hint">目标仓库：<code>' + OWNER + '/' + REPO +
       '</code><br>分支：<code>' + BRANCH + '</code><br>管理台仓库：<code>ynyy0/jb-repo-manager</code></p>' +
       '<div class="row" style="margin-top:14px"><button id="btn-refresh2" class="btn grow">刷新仓库</button>' +
-      '<button id="btn-logout" class="btn danger grow">断开</button></div></div>' +
+      '<button id="btn-logout" class="btn danger grow">断开</button></div>' +
+      '<button id="btn-selftest" class="btn block" style="margin-top:10px">权限自检（查为什么提交失败）</button>' +
+      '<div id="selftest-result"></div></div>' +
       '<div class="card"><b>使用说明</b><p class="hint">' +
       '① 目录页点目录进入，点 ⋯ 管理目录；<br>' +
       '② 插件页点 ⋯ 可改名、改图标、复制、剪切、移动、粘贴、删除；<br>' +
@@ -355,6 +387,7 @@
       loadAll().then(function () { render(); }).catch(function (e) { toast('刷新失败：' + e.message, true); });
     };
     $('btn-logout').onclick = logout;
+    $('btn-selftest').onclick = runSelfTest;
   }
 
   // ---------- sheets & dialogs ----------
@@ -544,6 +577,40 @@
     input.click();
   }
 
+  // ---------- permission self-test ----------
+  async function runSelfTest() {
+    var box = $('selftest-result');
+    if (!box) return;
+    var lines = [];
+    box.innerHTML = '<p class="hint">正在检测…</p>';
+    async function step(name, fn) {
+      try {
+        await fn();
+        lines.push({ name: name, ok: true });
+      } catch (e) {
+        lines.push({ name: name, ok: false, msg: e.message });
+      }
+      box.innerHTML = lines.map(function (l) {
+        return '<div class="st-row ' + (l.ok ? 'ok' : 'no') + '"><b>' + (l.ok ? '✓' : '✕') + '</b>' +
+          '<span>' + esc(l.name) + (l.msg ? '<small>' + esc(l.msg) + '</small>' : '') + '</span></div>';
+      }).join('');
+    }
+    await step('读取身份 GET /user', function () { return gh('/user'); });
+    await step('读取目标仓库 GET /repos/ynyy0/ynyy0.github.io', function () { return gh(repoPath('')); });
+    await step('读取分支 GET /git/ref/heads/main', function () {
+      return gh(repoPath('/git/ref/heads/' + BRANCH));
+    });
+    await step('写权限 POST /git/blobs（空 blob，无副作用）', function () {
+      return gh(repoPath('/git/blobs'), {
+        method: 'POST', body: JSON.stringify({ content: 'Cg==', encoding: 'base64' })
+      });
+    });
+    var bad = lines.filter(function (l) { return !l.ok; });
+    box.innerHTML += '<p class="hint">' + (bad.length
+      ? '写权限未通过 → 重新生成 PAT：需要 <b>Contents: Read and Write</b>（或 classic 的 <code>repo</code>），然后断开重连。'
+      : '全部通过：这个 Token 具备提交所需的读 / 写权限。') + '</p>';
+  }
+
   // ---------- commit ----------
   async function commit() {
     if (!state.pending.length) return toast('没有待提交的变更', true);
@@ -602,10 +669,12 @@
 
       state.pending = [];
       state.clipboard = null;
+      state.commitError = '';
       await loadAll();
       render();
       toast('提交成功，索引与站点正在自动更新');
     } catch (e) {
+      state.commitError = e.message;
       toast('提交失败：' + e.message, true);
     } finally {
       if (btn) btn.disabled = false;
@@ -646,7 +715,7 @@
     localStorage.removeItem('jbrm_token');
     sessionStorage.removeItem('jbrm_token');
     token = '';
-    state.pending = [];
+    // 保留待提交改动与未提交的元数据，方便换 Token 后继续提交
     state.clipboard = null;
     $('main').hidden = true;
     $('login').hidden = false;
