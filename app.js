@@ -15,15 +15,18 @@
   var state = {
     files: [],           // {path, sha, size}
     iconIndex: {},       // lowercase path -> real path
+    iconSha: {},         // lowercase path -> blob sha（用于破图标缓存）
+    iconPreviews: {},    // lowercase path -> 本地预览 blob URL（未提交）
     index: { byFilename: {}, byPackage: {} },
-    meta: { plugins: {} },
-    metaDirty: false,
+    meta: { plugins: {} },                       // 仓库基线（loadAll 总是刷新）
+    edits: { plugins: {}, categories: null },    // 本地未提交的改动
+    _eff: null,                                  // 合并后的视图缓存
     plugins: [],
     pending: [],
     commitError: '',
     view: 'dirs',
-    navDir: '',          // 目录页当前浏览路径（'' = 仓库根）
-    catFilter: null      // null = 分类列表；'__all__' = 全部插件；其它 = 某分类
+    navDir: '',
+    catFilter: null
   };
 
   // ---------- helpers ----------
@@ -56,7 +59,7 @@
     el.textContent = text;
     el.className = 'toast show' + (isErr ? ' err' : '');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { el.className = 'toast'; }, 2600);
+    toastTimer = setTimeout(function () { el.className = 'toast'; }, 3200);
   }
   function setMsg(id, text, isErr) {
     var el = $(id);
@@ -104,12 +107,8 @@
         throw new Error('PAT 权限不足：需要对 ynyy0.github.io 的 Contents: Read and Write（写权限）。' +
           '请重新生成 Token，然后在本页「连接」里断开并重新粘贴。');
       }
-      if (r.status === 401) {
-        throw new Error('Token 无效或已过期，请重新生成并重新连接。');
-      }
-      if (r.status === 409) {
-        throw new Error('提交冲突：期间仓库有新提交（通常是自动索引）。请点「刷新仓库」后重试。');
-      }
+      if (r.status === 401) throw new Error('Token 无效或已过期，请重新生成并重新连接。');
+      if (r.status === 409) throw new Error('提交冲突：期间仓库有新提交。请点「刷新仓库」后重试。');
       throw new Error(r.status + ' ' + r.statusText + (detail ? ' — ' + detail : ''));
     }
     return r.status === 204 ? null : r.json();
@@ -141,6 +140,35 @@
     return { byFilename: byFilename, byPackage: byPackage };
   }
 
+  // ---------- 元数据：基线 + 本地改动 ----------
+  function mergeMeta(base, edits) {
+    var out = { plugins: {} };
+    var bp = (base && base.plugins) || {};
+    Object.keys(bp).forEach(function (k) { out.plugins[k] = Object.assign({}, bp[k]); });
+    var ep = (edits && edits.plugins) || {};
+    Object.keys(ep).forEach(function (k) {
+      out.plugins[k] = Object.assign(out.plugins[k] || {}, ep[k]);
+    });
+    if (edits && edits.categories != null) out.categories = edits.categories.slice();
+    else if (base && base.categories) out.categories = base.categories.slice();
+    return out;
+  }
+  function effMeta() { return state._eff || mergeMeta(state.meta, state.edits); }
+  function hasEdits() {
+    return Object.keys(state.edits.plugins || {}).length > 0 || state.edits.categories !== null;
+  }
+  function emptyEdits() { return { plugins: {}, categories: null }; }
+
+  async function loadRepoMeta() {
+    var metaFile = state.files.find(function (f) { return f.path === 'repo-meta.json'; });
+    if (!metaFile) return { plugins: {} };
+    try {
+      var blob = await gh(repoPath('/git/blobs/' + metaFile.sha));
+      var parsed = JSON.parse(b64ToUtf8(blob.content));
+      return parsed && parsed.plugins ? parsed : { plugins: {} };
+    } catch (e) { return { plugins: {} }; }
+  }
+
   // ---------- data ----------
   async function loadAll() {
     toast('读取仓库…');
@@ -152,8 +180,12 @@
     });
 
     state.iconIndex = {};
+    state.iconSha = {};
     state.files.forEach(function (f) {
-      if (/\.(png|jpe?g|webp|gif)$/i.test(f.path)) state.iconIndex[f.path.toLowerCase()] = f.path;
+      if (/\.(png|jpe?g|webp|gif)$/i.test(f.path)) {
+        state.iconIndex[f.path.toLowerCase()] = f.path;
+        state.iconSha[f.path.toLowerCase()] = f.sha || '';
+      }
     });
 
     try {
@@ -161,46 +193,63 @@
       if (r.ok) state.index = parseIndex(await r.text());
     } catch (e) { /* 索引不可用时退化为文件名显示 */ }
 
-    // 有未提交的改名时保留内存里的元数据，避免「断开重连」把它冲掉
-    if (!state.metaDirty) {
-      var metaFile = state.files.find(function (f) { return f.path === 'repo-meta.json'; });
-      if (metaFile) {
-        try {
-          var blob = await gh(repoPath('/git/blobs/' + metaFile.sha));
-          var parsed = JSON.parse(b64ToUtf8(blob.content));
-          state.meta = parsed && parsed.plugins ? parsed : { plugins: {} };
-        } catch (e) { state.meta = { plugins: {} }; }
-      } else {
-        state.meta = { plugins: {} };
-      }
-    }
+    // 基线总是取仓库最新值，绝不用浏览器里的旧快照覆盖
+    state.meta = await loadRepoMeta();
     rebuild();
-    toast('已加载 ' + state.plugins.length + ' 个插件');
+
+    // 兼容历史遗留：把用「文件名猜的包名」当 key 的覆盖迁移到真实包标识符
+    var migrated = 0;
+    state.plugins.forEach(function (p) {
+      if (p.pkg === p.realPkg) return;
+      var old = (state.meta.plugins || {})[p.pkg];
+      if (!old) return;
+      var e = state.edits.plugins[p.realPkg] = state.edits.plugins[p.realPkg] || {};
+      Object.keys(old).forEach(function (k) { if (!(k in e)) e[k] = old[k]; });
+      migrated++;
+    });
+    if (migrated) noteMetaOnly('规范化元数据键（' + migrated + ' 个）');
+    render();
+    toast('已加载 ' + state.plugins.length + ' 个插件' + (hasEdits() ? '（有未提交改动）' : ''));
   }
 
   function rebuild() {
+    state._eff = mergeMeta(state.meta, state.edits);
+    var meta = state._eff.plugins || {};
     var iconIndex = state.iconIndex;
-    var meta = state.meta.plugins || {};
+    var previews = state.iconPreviews;
     state.plugins = state.files.filter(function (f) {
       return /\.deb$/i.test(f.path);
     }).map(function (f) {
       var pkg = guessPackage(basename(f.path));
       var info = state.index.byFilename[f.path] || state.index.byPackage[pkg] || {};
-      var ov = meta[pkg] || {};
-      var realPkg = info.Package || pkg; // deb control 里的真实包标识符
+      var realPkg = info.Package || pkg;
+      var ov = meta[realPkg] || meta[pkg] || {};
+      var edited = !!(state.edits.plugins[realPkg] || state.edits.plugins[pkg]);
       var wantIcon = 'icons/' + realPkg + '.png';
       var localIcon = iconIndex[wantIcon.toLowerCase()] || null;
       var icon = ov.icon || (localIcon ? localIcon :
         (info.Icon && /^https?:/.test(info.Icon) ? info.Icon : 'CydiaIcon.png'));
+      var fallbackIcon = info.Icon && /^https?:/.test(info.Icon) ? info.Icon : 'CydiaIcon.png';
+      var url;
+      if (localIcon && previews[localIcon.toLowerCase()]) {
+        url = previews[localIcon.toLowerCase()];
+      } else if (/^https?:/.test(icon)) {
+        url = icon;
+      } else {
+        // 用文件 sha 作版本号：图标内容变了 URL 就变，客户端缓存自动失效
+        var v = (state.iconSha[icon.toLowerCase()] || '').slice(0, 8) || '0';
+        url = rawUrl(icon) + '?v=' + v;
+      }
       return {
         path: f.path, dir: dirname(f.path), sha: f.sha, size: f.size, pkg: pkg,
-        realPkg: realPkg,
+        realPkg: realPkg, edited: edited,
+        pendingIcon: !!(localIcon && previews[localIcon.toLowerCase()]),
         name: ov.name || info.Name || pkg,
         version: info.Version || '',
         desc: ov.description || info.Description || '',
         section: info.Section || '',
-        icon: icon,
-        iconUrl: /^https?:/.test(icon) ? icon : rawUrl(icon),
+        icon: icon, iconUrl: url, iconFallback: /^https?:/.test(fallbackIcon)
+          ? fallbackIcon : rawUrl(fallbackIcon),
         iconPath: localIcon
       };
     });
@@ -210,11 +259,10 @@
     return state.plugins.find(function (p) { return p.path === path; });
   }
 
-  // ---------- 分类（分组）模型 ----------
-  // 分类存在 repo-meta.json：categories=[...]，plugins[pkg].cats=[...]、plugins[pkg].section=...
-  // deb 文件位置不变，APT 索引通过 section 覆盖体现分类。
+  // ---------- 分类（分组） ----------
   function pluginCats(p) {
-    var ov = (state.meta.plugins || {})[p.pkg] || {};
+    var m = effMeta().plugins || {};
+    var ov = m[p.realPkg] || m[p.pkg] || {};
     if (ov.cats && ov.cats.length) return ov.cats.slice();
     return [ov.section || p.section || '未分类'];
   }
@@ -222,7 +270,8 @@
     return state.plugins.filter(function (p) { return pluginCats(p).indexOf(cat) >= 0; });
   }
   function categories() {
-    if (Array.isArray(state.meta.categories)) return state.meta.categories.slice();
+    var em = effMeta();
+    if (em.categories) return em.categories.slice();
     var map = {};
     state.plugins.forEach(function (p) {
       pluginCats(p).forEach(function (c) { map[c] = 1; });
@@ -233,8 +282,7 @@
     return names;
   }
   function setCategories(list) {
-    state.meta.categories = list;
-    state.metaDirty = true;
+    state.edits.categories = list.slice();
     noteMetaOnly('更新分类目录');
   }
 
@@ -281,7 +329,6 @@
 
   // ---------- pending ----------
   function addPending(p) {
-    // 同一路径的重复新增直接替换（改图标「如有重复直接替换」）
     if (p.op === 'add') {
       state.pending = state.pending.filter(function (x) {
         return !(x.op === 'add' && x.path === p.path);
@@ -295,26 +342,19 @@
     state.pending = state.pending.filter(function (p) { return String(p.id) !== id; });
     rebuild(); render();
   }
-  // 元数据变更只保留一条待提交记录
   function noteMetaOnly(text) {
-    state.metaDirty = true;
     var exist = state.pending.find(function (p) { return p.op === 'meta'; });
-    if (exist) {
-      exist.text = text;
-      render();
-    } else {
-      addPending({ op: 'meta', text: text });
-    }
+    if (exist) { exist.text = text; rebuild(); render(); }
+    else addPending({ op: 'meta', text: text });
   }
   function setMetaFor(pkg, cats, section) {
-    state.meta.plugins = state.meta.plugins || {};
-    var ov = state.meta.plugins[pkg] = state.meta.plugins[pkg] || {};
-    ov.cats = cats.slice();
-    if (section) ov.section = section;
+    var e = state.edits.plugins[pkg] = state.edits.plugins[pkg] || {};
+    e.cats = cats.slice();
+    if (section) e.section = section;
     noteMetaOnly('元数据：' + pkg + ' → ' + cats.join(' / '));
   }
 
-  // ---------- session persistence (survives a page refresh) ----------
+  // ---------- 会话持久化：只存「改动」，不存仓库快照 ----------
   function saveState() {
     try {
       var keep = state.pending.filter(function (p) { return !p.file; }).map(function (p) {
@@ -324,8 +364,7 @@
         };
       });
       sessionStorage.setItem('jbrm_state', JSON.stringify({
-        pending: keep, meta: state.meta, metaDirty: state.metaDirty,
-        commitError: state.commitError
+        v: 2, pending: keep, edits: state.edits, commitError: state.commitError
       }));
     } catch (e) { /* storage unavailable */ }
   }
@@ -334,16 +373,37 @@
       var raw = sessionStorage.getItem('jbrm_state');
       if (!raw) return;
       var s = JSON.parse(raw);
+      // v1 是整份 meta 快照，会覆盖仓库数据 —— 直接丢弃
+      if (s.v !== 2) { sessionStorage.removeItem('jbrm_state'); return; }
       if (s.pending && s.pending.length) state.pending = s.pending;
-      if (s.meta && s.meta.plugins) {
-        state.meta = s.meta;
-        state.metaDirty = !!s.metaDirty;
+      if (s.edits) {
+        state.edits = {
+          plugins: s.edits.plugins || {},
+          categories: s.edits.categories != null ? s.edits.categories : null
+        };
       }
       state.commitError = s.commitError || '';
       seq = state.pending.reduce(function (m, p) {
         return Math.max(m, Number(p.id) || 0);
       }, 0);
     } catch (e) { /* ignore */ }
+  }
+  async function clearLocalCache(silent) {
+    try {
+      Object.keys(state.iconPreviews).forEach(function (k) {
+        URL.revokeObjectURL(state.iconPreviews[k]);
+      });
+      state.iconPreviews = {};
+      state.pending = [];
+      state.edits = emptyEdits();
+      state.commitError = '';
+      sessionStorage.removeItem('jbrm_state');
+      localStorage.removeItem('jbrm_cache_notice');
+      await loadAll();
+      if (!silent) toast('本地缓存已清除，已重新读取仓库最新状态');
+    } catch (e) {
+      if (!silent) toast('清除失败：' + e.message, true);
+    }
   }
 
   // ---------- rendering ----------
@@ -361,8 +421,7 @@
 
     var titles = { dirs: state.navDir || '目录', pending: '待提交', me: '连接' };
     $('nav-title').textContent = v === 'plugins'
-      ? (!state.catFilter ? '分类' :
-         (state.catFilter === '__all__' ? '全部插件' : state.catFilter))
+      ? (!state.catFilter ? '分类' : (state.catFilter === '__all__' ? '全部插件' : state.catFilter))
       : titles[v];
     $('nav-add').textContent = '+';
 
@@ -371,13 +430,21 @@
     $('search').placeholder = v === 'dirs' ? '搜索目录 / 插件'
       : (state.catFilter ? '搜索插件' : '搜索分类');
 
+    var dirty = state.pending.length || (hasEdits() ? 1 : 0) ||
+      Object.keys(state.iconPreviews).length;
+    var bar = $('dirty-bar');
+    bar.hidden = dirty === 0;
+    if (dirty) {
+      $('dirty-text').textContent = '⚠ ' + (state.pending.length || '若干') +
+        ' 项改动仅在本地预览，提交后才会生效';
+    }
+
     document.querySelectorAll('.tab').forEach(function (t) {
       t.classList.toggle('active', t.getAttribute('data-tab') === v);
     });
-    var n = state.pending.length;
     var badge = $('tab-badge');
-    badge.hidden = n === 0;
-    badge.textContent = n;
+    badge.hidden = state.pending.length === 0;
+    badge.textContent = state.pending.length;
 
     if (v === 'dirs') renderDirs();
     if (v === 'plugins') renderPlugins();
@@ -391,8 +458,9 @@
     list.forEach(function (p) {
       html += '<div class="plugin">' +
         '<img class="picon" src="' + esc(p.iconUrl) + '" alt="" loading="lazy" ' +
-        'onerror="this.onerror=null;this.src=\'' + esc(rawUrl('CydiaIcon.png')) + '\'">' +
-        '<div class="pinfo"><div class="pname">' + esc(p.name) + '</div>' +
+        'onerror="this.onerror=null;this.src=\'' + esc(p.iconFallback) + '\'">' +
+        '<div class="pinfo"><div class="pname">' + esc(p.name) +
+        (p.edited || p.pendingIcon ? '<span class="tag-pending">待提交</span>' : '') + '</div>' +
         '<div class="pmeta">' + esc(p.version || p.pkg) +
         (p.section ? ' · ' + esc(p.section) : '') + ' · ' + fmtSize(p.size) + '</div>' +
         (p.desc ? '<div class="pdesc">' + esc(p.desc) + '</div>' : '') + '</div>' +
@@ -412,6 +480,7 @@
       return !q || (p.name + ' ' + p.pkg + ' ' + p.desc).toLowerCase().indexOf(q) >= 0;
     });
     var otherFiles = filesInDir(cur).filter(function (f) { return !/\.deb$/i.test(f.path); });
+    var images = otherFiles.filter(function (f) { return /\.(png|jpe?g|webp|gif)$/i.test(f.path); });
 
     var html = '<div class="section-title">' + (cur || '仓库根目录') + ' · ' +
       subs.length + ' 个目录</div>';
@@ -429,17 +498,28 @@
     if (!subs.length) html += '<div class="empty">' + (q ? '没有匹配的目录' : '没有子目录') + '</div>';
     html += '</div>';
 
+    if (images.length) {
+      html += '<div class="section-title">图标库 · ' + images.length + ' 张（点图看大图）</div><div class="icon-grid">';
+      images.forEach(function (f) {
+        var v = (f.sha || '').slice(0, 8) || '0';
+        var u = rawUrl(f.path) + '?v=' + v;
+        html += '<div class="icon-item" data-icon="' + esc(u) + '" data-iconname="' +
+          esc(basename(f.path)) + '"><img src="' + esc(u) + '" alt="" loading="lazy" ' +
+          'onerror="this.style.opacity=.25"><span>' + esc(basename(f.path)) + '</span></div>';
+      });
+      html += '</div>';
+    }
     if (directDebs.length) {
       html += '<div class="section-title">本目录插件 · ' + directDebs.length + ' 个</div>';
       html += pluginCards(directDebs);
     }
-    if (otherFiles.length) {
-      html += '<div class="card"><b>其它文件</b><p class="hint">' + otherFiles.length +
-        ' 个（图标、索引、页面等）</p></div>';
+    var rest = otherFiles.length - images.length;
+    if (rest > 0) {
+      html += '<div class="card"><b>其它文件</b><p class="hint">' + rest + ' 个（索引、页面等）</p></div>';
     }
     if (!q && !cur) {
-      html += '<div class="card"><b>提示</b><p class="hint">点目录行进入子目录，可逐级浏览；' +
-        '点 ⋯ 可重命名、删除目录或在此上传插件。右上角 + 在当前目录下新建目录。</p></div>';
+      html += '<div class="card"><b>提示</b><p class="hint">点目录行进入子目录；' +
+        '点 ⋯ 可重命名 / 删除目录、在此上传插件。进入 icons/ 可查看全部图标。</p></div>';
     }
     $('view-dirs').innerHTML = html;
   }
@@ -448,7 +528,10 @@
     var names = categories().filter(function (c) {
       return !q || c.toLowerCase().indexOf(q) >= 0;
     });
-    var html = '<div class="section-title">分类目录 · ' + names.length + ' 个</div><div class="list-card">';
+    var custom = state.edits.categories !== null || effMeta().categories;
+    var html = '<div class="section-title">分类目录 · ' + names.length + ' 个' +
+      (state.edits.categories !== null ? '<span class="tag-pending">待提交</span>' : '') + '</div>';
+    html += '<div class="list-card">';
     html += '<div class="cell" data-cat="__all__"><div class="cell-main">' +
       '<div class="cell-name">全部插件</div>' +
       '<div class="cell-sub">所有分类 · 共 ' + state.plugins.length + ' 个</div></div>' +
@@ -464,8 +547,9 @@
     });
     html += '</div>';
     if (!names.length) html += '<div class="empty">' + (q ? '没有匹配的分类' : '还没有分类') + '</div>';
-    html += '<div class="card"><b>提示</b><p class="hint">右上角 + 添加目录；点分类行的 ⋯ 可重命名、删除目录。' +
-      '插件归类只记录归属，不会改动 deb 文件位置，越狱源不受影响。</p></div>';
+    html += '<div class="card"><b>提示</b><p class="hint">右上角 + 添加目录；分类 ⋯ 可重命名 / 删除目录。' +
+      (custom ? '' : '当前分组按索引里的 Section 自动生成。') +
+      '改动需提交后才写入仓库。</p></div>';
     $('view-plugins').innerHTML = html;
   }
 
@@ -478,11 +562,8 @@
       });
     var title = state.catFilter === '__all__' ? '全部插件' : state.catFilter;
     var html = '<div class="section-title">' + esc(title) + ' · ' + list.length + ' 个插件</div>';
-    if (!list.length) {
-      html += '<div class="empty">这里还没有插件</div>';
-    } else {
-      html += pluginCards(list);
-    }
+    if (!list.length) html += '<div class="empty">这里还没有插件</div>';
+    else html += pluginCards(list);
     $('view-plugins').innerHTML = html;
   }
 
@@ -492,6 +573,9 @@
     var html = '<div class="stat"><div><b>' + state.plugins.length + '</b><span>插件</span></div>' +
       '<div><b>' + categories().length + '</b><span>分类</span></div>' +
       '<div><b>' + state.pending.length + '</b><span>待提交</span></div></div>';
+    html += '<div class="card"><b>⚠ 这些改动还没生效</b><p class="hint">' +
+      '下面的改动只是本地预览，只有点「提交更改」写入仓库后才会真正生效、并触发源索引刷新。' +
+      '提交失败时改动会保留，可重试；也可点「清除本地缓存」丢弃全部未提交改动。</p></div>';
     html += '<div class="section-title">待提交变更</div><div class="list-card">';
     if (!state.pending.length) {
       html += '<div class="empty">还没有改动</div>';
@@ -506,13 +590,12 @@
     }
     html += '</div>';
     if (state.commitError) {
-      html += '<div class="card err-card"><b>提交失败</b>' +
+      html += '<div class="card err-card"><b>上次提交失败（改动未生效）</b>' +
         '<p class="hint err-text">' + esc(state.commitError) + '</p>' +
         '<p class="hint"><b>怎么修</b><br>' +
-        '① GitHub → Settings → Developer settings → Personal access tokens<br>' +
-        '② 新建 Token：<b>fine-grained</b> 要选 Resource owner <code>ynyy0</code>、仓库 <code>ynyy0.github.io</code>、权限 <b>Contents: Read and Write</b>；<b>classic</b> 直接勾 <code>repo</code><br>' +
-        '③ 回「连接」页 → 断开 → 粘贴新 Token 重新连接<br>' +
-        '④ 回来重新提交（待提交的改动不会丢）</p>' +
+        '① 生成 PAT：<b>classic</b> 勾 <code>repo</code>；<b>fine-grained</b> 选 Resource owner <code>ynyy0</code>、仓库 <code>ynyy0.github.io</code>、权限 <b>Contents: Read and Write</b><br>' +
+        '② 回「连接」页 → 断开 → 粘贴新 Token 重新连接<br>' +
+        '③ 回来重新提交（改动不会丢）</p>' +
         '<div class="row" style="margin-top:12px">' +
         '<a class="btn grow linkbtn" href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">生成新 PAT ↗</a>' +
         '<button id="btn-selftest2" class="btn grow">权限自检</button></div></div>';
@@ -521,11 +604,24 @@
       (state.pending.length ? '' : ' disabled') + '>提交更改（' + state.pending.length + '）</button>' +
       '<button id="btn-clear" class="btn block"' + (state.pending.length ? '' : ' disabled') +
       ' style="margin-top:9px">清空待提交</button>' +
-      '<p class="hint">所有变更合并为一次原子提交；提交后源仓库会自动刷新索引并部署。</p></div>';
+      '<button id="btn-clearcache2" class="btn block" style="margin-top:9px">清除本地缓存</button>' +
+      '<p class="hint">提交时会读取仓库最新元数据再合并，不会用旧缓存覆盖别人的改动。</p></div>';
     $('view-pending').innerHTML = html;
     $('btn-commit').onclick = commit;
     $('btn-clear').onclick = function () {
-      state.pending = []; rebuild(); render(); toast('已清空');
+      confirmSheet('清空待提交', '将丢弃全部 ' + state.pending.length +
+        ' 项未提交改动（改名、归类、上传等），此操作不可撤销。', '确认清空', function () {
+        state.pending = [];
+        state.edits = emptyEdits();
+        Object.keys(state.iconPreviews).forEach(function (k) { URL.revokeObjectURL(state.iconPreviews[k]); });
+        state.iconPreviews = {};
+        rebuild(); render(); toast('已清空');
+      });
+    };
+    $('btn-clearcache2').onclick = function () {
+      confirmSheet('清除本地缓存', '将丢弃浏览器里保存的全部未提交改动，并从仓库重新读取最新数据。Token 不会被清除。', '确认清除', function () {
+        clearLocalCache();
+      });
     };
     if ($('btn-selftest2')) {
       $('btn-selftest2').onclick = function () {
@@ -541,34 +637,49 @@
       '<div class="row" style="margin-top:14px"><button id="btn-refresh2" class="btn grow">刷新仓库</button>' +
       '<button id="btn-logout" class="btn danger grow">断开</button></div>' +
       '<button id="btn-selftest" class="btn block" style="margin-top:10px">权限自检（查为什么提交失败）</button>' +
+      '<button id="btn-clearcache" class="btn block" style="margin-top:10px">清除本地缓存</button>' +
       '<div id="selftest-result"></div></div>' +
       '<div class="card"><b>使用说明</b><p class="hint">' +
-      '① 目录页逐级进入子目录，点 ⋯ 可重命名 / 删除目录、在此上传；<br>' +
-      '② 全部插件页是分类目录，右上角 + 添加目录，分类 ⋯ 可重命名 / 删除；<br>' +
-      '③ 分类内 + 上传的插件默认归到该分类；插件 ⋯ 可移动到… / 复制到… / 剪切到… 选分类；<br>' +
-      '④ 改图标自动存成 <code>icons/包标识符.png</code>，重名直接替换；<br>' +
-      '⑤ 单文件建议 ≤ 50 MB，移出 <code>debs/</code> 的插件不会被索引收录。</p></div>' +
-      '<div class="card"><b>关于 Token</b><p class="hint">只保存在本机浏览器，随请求直发 api.github.com，' +
+      '① 目录页逐级进入子目录，进入 icons/ 可查看图标库；<br>' +
+      '② 全部插件页是分类目录，+ 添加目录，分类 ⋯ 可重命名 / 删除；<br>' +
+      '③ 插件 ⋯ 可改名、改图标、移动到… / 剪切到…（选分类或仓库目录）、删除；<br>' +
+      '④ 所有改动先进入「待提交」，只有提交后才真正生效；<br>' +
+      '⑤ 改图标存成 <code>icons/包标识符.png</code>，图标链接自带版本号，换图后客户端不会再用旧缓存。</p></div>' +
+      '<div class="card"><b>关于 Token</b><p class="hint">只保存在本机浏览器，直发 api.github.com，' +
       '不写入仓库、不经过第三方。可随时「断开」清除。</p></div>';
     $('btn-refresh2').onclick = function () {
-      loadAll().then(function () { render(); }).catch(function (e) { toast('刷新失败：' + e.message, true); });
+      loadAll().then(function () { toast('已重新读取仓库最新状态'); })
+        .catch(function (e) { toast('刷新失败：' + e.message, true); });
     };
     $('btn-logout').onclick = logout;
     $('btn-selftest').onclick = runSelfTest;
+    $('btn-clearcache').onclick = function () {
+      confirmSheet('清除本地缓存', '将丢弃浏览器里保存的全部未提交改动，并从仓库重新读取最新数据。Token 不会被清除。', '确认清除', function () {
+        clearLocalCache();
+      });
+    };
   }
 
   // ---------- sheets & dialogs ----------
   var sheetActions = [];
-  function openSheet(title, actions) {
+  function openSheet(title, actions, message) {
     sheetActions = actions;
     $('sheet-title').textContent = title;
-    $('sheet-actions').innerHTML = actions.map(function (a, i) {
-      return '<button class="' + (a.danger ? 'danger' : '') + '" data-act="' + i + '">' +
-        '<span class="si">' + (a.icon || '•') + '</span><span>' + esc(a.label) + '</span></button>';
-    }).join('');
+    $('sheet-actions').innerHTML =
+      (message ? '<p class="sheet-msg">' + esc(message) + '</p>' : '') +
+      actions.map(function (a, i) {
+        return '<button class="' + (a.danger ? 'danger' : '') + '" data-act="' + i + '">' +
+          '<span class="si">' + (a.icon || '•') + '</span><span>' + esc(a.label) + '</span></button>';
+      }).join('');
     $('sheet').hidden = false;
   }
   function closeSheet() { $('sheet').hidden = true; }
+  function confirmSheet(title, message, okLabel, onOk) {
+    openSheet(title, [
+      { label: '取消', icon: '×', fn: function () {} },
+      { label: okLabel || '确认删除', icon: '✕', danger: true, fn: onOk }
+    ], message);
+  }
 
   var dialogCb = null;
   function openDialog(title, value, hint, cb) {
@@ -581,37 +692,55 @@
   }
   function closeDialog() { $('dialog').hidden = true; dialogCb = null; }
 
-  // 目标目录 = 全部插件页的分类列表
-  function pickCat(title, cb) {
-    var list = categories();
-    if (list.indexOf('未分类') < 0) list.push('未分类');
-    var actions = list.map(function (c) {
-      return { label: c + '/', icon: '▸', fn: function () { cb(c); } };
+  // 目标 = 分类目录（默认）＋ 真实仓库目录（可选，会真的移动 deb）
+  function pickTarget(title, cb) {
+    var actions = [];
+    categories().forEach(function (c) {
+      actions.push({ label: '分类 · ' + c, icon: '▣', fn: function () { cb({ type: 'cat', value: c }); } });
     });
     actions.push({
-      label: '新建目录…', icon: '+', fn: function () {
-        openDialog('新建分类目录', '', '输入目录名，然后直接选它', function (v) {
+      label: '新建分类目录…', icon: '+', fn: function () {
+        openDialog('新建分类目录', '', '输入目录名，然后直接归到它', function (v) {
           var name = String(v).trim();
           if (!name) return toast('目录名不能为空', true);
           var cs = categories();
           if (cs.indexOf(name) < 0) { cs.push(name); setCategories(cs); }
-          cb(name);
+          cb({ type: 'cat', value: name });
         });
       }
     });
-    openSheet(title, actions);
+    allDirs().filter(function (d) {
+      return d !== '.github' && d.indexOf('.github/') !== 0;
+    }).forEach(function (d) {
+      actions.push({ label: '仓库目录 · ' + d + '/', icon: '▸', fn: function () { cb({ type: 'dir', value: d }); } });
+    });
+    actions.push({
+      label: '新建仓库目录…', icon: '+', fn: function () {
+        openDialog('新建仓库目录', '', '输入目录名，deb 会真的移动过去', function (v) {
+          var name = cleanDir(v);
+          if (!validDir(name)) return toast('目录名不合法', true);
+          var full = cleanDir(name);
+          if (allDirs().indexOf(full) < 0) {
+            addPending({ op: 'add', path: full + '/.gitkeep', text: '\n', note: '新建目录' });
+          }
+          cb({ type: 'dir', value: full });
+        });
+      }
+    });
+    openSheet(title, actions,
+      '选「分类」只改归类、deb 文件不动；选「仓库目录」会真的移动 deb 文件。移出 debs/ 的插件不会出现在 APT 索引里。');
   }
 
   // ---------- 分类目录操作 ----------
   function addCategory() {
-    openDialog('添加目录', '', '输入分类目录名（插件可归类到这个目录）', function (v) {
+    openDialog('添加目录', '', '输入分类目录名（添加后需提交才生效）', function (v) {
       var name = String(v).trim();
       if (!name) return toast('目录名不能为空', true);
       var cs = categories();
       if (cs.indexOf(name) >= 0) return toast('目录已存在', true);
       cs.push(name);
       setCategories(cs);
-      toast('已添加目录「' + name + '」');
+      toast('已加入待提交：添加目录「' + name + '」，请点提交');
     });
   }
 
@@ -619,44 +748,49 @@
     var actions = [
       { label: '重命名目录', icon: '✎', fn: function () {
         openDialog('重命名目录', cat, '该分类下 ' + pluginsInCat(cat).length +
-          ' 个插件会一起归到新名称', function (v) {
+          ' 个插件会一起归到新名称（需提交才生效）', function (v) {
           var nw = String(v).trim();
           if (!nw || nw === cat) return toast('名称不合法或未变化', true);
           var cs = categories();
           if (cs.indexOf(nw) >= 0 && nw !== cat) return toast('目录已存在', true);
-          cs = cs.map(function (c) { return c === cat ? nw : c; });
-          state.meta.categories = cs;
+          state.edits.categories = cs.map(function (c) { return c === cat ? nw : c; });
           state.plugins.forEach(function (p) {
             var pc = pluginCats(p);
             if (pc.indexOf(cat) < 0) return;
             var nc = pc.map(function (c) { return c === cat ? nw : c; });
-            var ov = (state.meta.plugins || {})[p.pkg] || {};
-            setMetaFor(p.pkg, nc, (ov.section || p.section) === cat ? nw : ov.section);
+            var m = effMeta().plugins || {};
+            var ov = m[p.realPkg] || {};
+            setMetaFor(p.realPkg, nc, (ov.section || p.section) === cat ? nw : ov.section);
           });
           noteMetaOnly('重命名目录：' + cat + ' → ' + nw);
           if (state.catFilter === cat) state.catFilter = nw;
-          toast('已重命名，插件归类已更新');
+          toast('已加入待提交，请点提交');
         });
       } },
       { label: '删除目录', icon: '✕', danger: true, fn: function () {
-        openDialog('删除目录', '', '将移除「' + cat + '」分组，组内 ' + pluginsInCat(cat).length +
-          ' 个插件归入「未分类」（不会删除 deb 文件）。输入目录名确认', function (v) {
-          if (String(v).trim() !== cat) return toast('输入的目录名不一致，已取消', true);
-          var cs = categories().filter(function (c) { return c !== cat; });
-          if (cs.indexOf('未分类') < 0) cs.push('未分类');
-          state.meta.categories = cs;
-          state.plugins.forEach(function (p) {
-            var pc = pluginCats(p);
-            if (pc.indexOf(cat) < 0) return;
-            var nc = pc.filter(function (c) { return c !== cat; });
-            if (!nc.length) nc = ['未分类'];
-            var ov = (state.meta.plugins || {})[p.pkg] || {};
-            setMetaFor(p.pkg, nc, (ov.section || p.section) === cat ? '未分类' : ov.section);
+        confirmSheet('删除分类目录',
+          '将移除「' + cat + '」分组，组内 ' + pluginsInCat(cat).length +
+          ' 个插件归入「未分类」。deb 文件不会被删除，但改动需提交后才生效。',
+          '继续', function () {
+            openDialog('删除目录', '', '输入目录名「' + cat + '」确认删除', function (v) {
+              if (String(v).trim() !== cat) return toast('输入的目录名不一致，已取消', true);
+              var cs = categories().filter(function (c) { return c !== cat; });
+              if (cs.indexOf('未分类') < 0) cs.push('未分类');
+              state.edits.categories = cs;
+              state.plugins.forEach(function (p) {
+                var pc = pluginCats(p);
+                if (pc.indexOf(cat) < 0) return;
+                var nc = pc.filter(function (c) { return c !== cat; });
+                if (!nc.length) nc = ['未分类'];
+                var m = effMeta().plugins || {};
+                var ov = m[p.realPkg] || {};
+                setMetaFor(p.realPkg, nc, (ov.section || p.section) === cat ? '未分类' : ov.section);
+              });
+              noteMetaOnly('删除目录：' + cat);
+              if (state.catFilter === cat) state.catFilter = null;
+              toast('已加入待提交，请点提交');
+            });
           });
-          noteMetaOnly('删除目录：' + cat);
-          if (state.catFilter === cat) state.catFilter = null;
-          toast('目录已移除，插件归入未分类');
-        });
       } }
     ];
     openSheet(cat + '/', actions);
@@ -668,40 +802,46 @@
     if (!p) return;
     var actions = [
       { label: '改名', icon: '✎', fn: function () {
-        openDialog('修改插件名称', p.name, '显示名会覆盖 APT 索引里的 Name', function (v) {
+        openDialog('修改插件名称', p.name, '显示名会覆盖 APT 索引里的 Name（需提交才生效）', function (v) {
           v = String(v).trim();
           if (!v || v === p.name) return;
-          state.meta.plugins = state.meta.plugins || {};
-          state.meta.plugins[p.pkg] = state.meta.plugins[p.pkg] || {};
-          state.meta.plugins[p.pkg].name = v;
+          var e = state.edits.plugins[p.realPkg] = state.edits.plugins[p.realPkg] || {};
+          e.name = v;
           noteMetaOnly('改名：' + p.name + ' → ' + v);
-          toast('已加入待提交');
+          toast('已加入待提交，请点提交');
         });
       } },
       { label: '改图标', icon: '▣', fn: function () { changeIcon(p); } },
       { label: '移动到…', icon: '⇢', fn: function () {
-        pickCat('移动到哪个分类目录', function (cat) {
-          setMetaFor(p.pkg, [cat], cat);
-          toast('已归到「' + cat + '」，原分类不再显示');
-        });
-      } },
-      { label: '复制到…', icon: '⧉', fn: function () {
-        pickCat('复制到哪个分类目录（保留原分类）', function (cat) {
-          var pc = pluginCats(p);
-          if (pc.indexOf(cat) >= 0) return toast('该插件已在此分类下', true);
-          setMetaFor(p.pkg, pc.concat([cat]), undefined);
-          toast('已同时归到「' + cat + '」');
-        });
+        pickTarget('移动到…', function (t) { applyMove(p, t, false); });
       } },
       { label: '剪切到…', icon: '✂', fn: function () {
-        pickCat('剪切到哪个分类目录', function (cat) {
-          setMetaFor(p.pkg, [cat], cat);
-          toast('已剪切到「' + cat + '」');
-        });
+        pickTarget('剪切到…', function (t) { applyMove(p, t, true); });
       } },
-      { label: '删除', icon: '✕', danger: true, fn: function () { deletePlugin(p); } }
+      { label: '删除', icon: '✕', danger: true, fn: function () {
+        var extra = p.iconPath ? '，同时会把 ' + p.iconPath + ' 一起加入待删除（可单独撤销）' : '';
+        confirmSheet('删除插件',
+          '将删除 ' + p.path + extra + '。此操作不可逆，且需提交后才真正生效。',
+          '继续删除', function () { deletePlugin(p); });
+      } }
     ];
     openSheet(p.name, actions);
+  }
+
+  function applyMove(p, target, isCut) {
+    if (target.type === 'cat') {
+      setMetaFor(p.realPkg, [target.value], target.value);
+      toast((isCut ? '已剪切' : '已移动') + '到「' + target.value + '」，请点提交');
+      return;
+    }
+    var dest = (target.value ? target.value + '/' : '') + basename(p.path);
+    if (dest === p.path) return toast('目标与原位置相同', true);
+    addPending({ op: 'move', path: p.path, newPath: dest, sha: p.sha, size: p.size, note: p.name });
+    if (target.value !== 'debs' && target.value.indexOf('debs/') !== 0) {
+      toast('已移动到 ' + target.value + '/，注意：该目录不会被 APT 索引收录', true);
+    } else {
+      toast('已移动到 ' + target.value + '/，请点提交');
+    }
   }
 
   function changeIcon(p) {
@@ -711,16 +851,17 @@
       var f = e.target.files && e.target.files[0];
       if (!f) return;
       if (f.size > MAX_BYTES) return toast('图片过大', true);
-      // 图标统一命名：icons/包标识符.png（真实 deb control Package），重名直接替换
-      var iconPath = 'icons/' + (p.realPkg || p.pkg) + '.png';
+      var iconPath = 'icons/' + p.realPkg + '.png';
       addPending({
         op: 'add', path: iconPath, file: f,
         size: f.size, note: '改图标 · ' + p.name + ' → ' + iconPath
       });
-      var cur = findPlugin(p.path);
-      if (cur) cur.iconUrl = URL.createObjectURL(f);
+      var old = state.iconPreviews[iconPath.toLowerCase()];
+      if (old) URL.revokeObjectURL(old);
+      state.iconPreviews[iconPath.toLowerCase()] = URL.createObjectURL(f);
+      rebuild();
       render();
-      toast('新图标已加入待提交（' + iconPath + '）');
+      toast('图标预览已更新（' + iconPath + '），提交后才生效');
     };
     input.click();
   }
@@ -730,14 +871,14 @@
     if (p.iconPath && !state.pending.some(function (x) { return x.path === p.iconPath && x.op === 'delete'; })) {
       addPending({ op: 'delete', path: p.iconPath, note: '联动图标（可单独撤销）' });
     }
-    toast('已加入待提交');
+    toast('已加入待提交，请点提交');
   }
 
   // ---------- directory actions ----------
   function dirMenu(d) {
     var actions = [
       { label: '重命名目录', icon: '✎', fn: function () {
-        openDialog('重命名目录', basename(d), '该目录下全部文件（含子目录）会一起移动', function (v) {
+        openDialog('重命名目录', basename(d), '该目录下全部文件（含子目录）会一起移动，需提交才生效', function (v) {
           var nd = cleanDir(v);
           if (!validDir(nd) || nd === basename(d)) return toast('目录名不合法或未变化', true);
           var parent = dirname(d);
@@ -751,21 +892,25 @@
               sha: f.sha, size: f.size, note: '目录重命名'
             });
           });
-          toast('已加入 ' + affected.length + ' 个移动');
+          toast('已加入 ' + affected.length + ' 个移动，请点提交');
         });
       } },
       { label: '在此上传插件', icon: '↑', fn: function () { uploadTo(d, null); } },
       { label: '删除目录', icon: '✕', danger: true, fn: function () {
         var affected = state.files.filter(function (f) { return f.path.indexOf(d + '/') === 0; });
         if (!affected.length) return toast('该目录下没有文件', true);
-        openDialog('删除目录', '', '将删除 ' + d + '/ 下 ' + affected.length +
-          ' 个文件，输入目录名确认', function (v) {
-          if (String(v).trim() !== basename(d)) return toast('输入的目录名不一致，已取消', true);
-          affected.forEach(function (f) {
-            addPending({ op: 'delete', path: f.path, size: f.size, note: '删除目录' });
+        confirmSheet('删除目录',
+          '将删除 ' + d + '/ 下 ' + affected.length +
+          ' 个文件（含子目录里的插件、图标）。此操作不可逆，需提交后才真正生效。',
+          '继续', function () {
+            openDialog('删除目录', '', '输入目录名「' + basename(d) + '」确认删除', function (v) {
+              if (String(v).trim() !== basename(d)) return toast('输入的目录名不一致，已取消', true);
+              affected.forEach(function (f) {
+                addPending({ op: 'delete', path: f.path, size: f.size, note: '删除目录' });
+              });
+              toast('已加入 ' + affected.length + ' 个删除，请点提交');
+            });
           });
-          toast('已加入 ' + affected.length + ' 个删除');
-        });
       } }
     ];
     openSheet(d + '/', actions);
@@ -785,14 +930,11 @@
           op: 'add', path: (dir ? dir + '/' : '') + name, file: f,
           size: f.size, note: '上传插件' + (cat ? ' · 归入 ' + cat : '')
         });
-        if (cat) {
-          // 上传后默认归到当前分类目录（deb 仍在 debs/ 下，索引不受影响）
-          setMetaFor(guessPackage(name), [cat], cat);
-        }
+        if (cat) setMetaFor(guessPackage(name), [cat], cat);
         added++;
       });
       if (skipped) toast(skipped + ' 个文件超过 50 MB 已跳过', true);
-      else toast('已加入 ' + added + ' 个插件' + (cat ? '（归入 ' + cat + '）' : ''));
+      else toast('已加入 ' + added + ' 个插件' + (cat ? '（归入 ' + cat + '）' : '') + '，请点提交');
     };
     input.click();
   }
@@ -804,12 +946,8 @@
     var lines = [];
     box.innerHTML = '<p class="hint">正在检测…</p>';
     async function step(name, fn) {
-      try {
-        await fn();
-        lines.push({ name: name, ok: true });
-      } catch (e) {
-        lines.push({ name: name, ok: false, msg: e.message });
-      }
+      try { await fn(); lines.push({ name: name, ok: true }); }
+      catch (e) { lines.push({ name: name, ok: false, msg: e.message }); }
       box.innerHTML = lines.map(function (l) {
         return '<div class="st-row ' + (l.ok ? 'ok' : 'no') + '"><b>' + (l.ok ? '✓' : '✕') + '</b>' +
           '<span>' + esc(l.name) + (l.msg ? '<small>' + esc(l.msg) + '</small>' : '') + '</span></div>';
@@ -817,9 +955,7 @@
     }
     await step('读取身份 GET /user', function () { return gh('/user'); });
     await step('读取目标仓库 GET /repos/ynyy0/ynyy0.github.io', function () { return gh(repoPath('')); });
-    await step('读取分支 GET /git/ref/heads/main', function () {
-      return gh(repoPath('/git/ref/heads/' + BRANCH));
-    });
+    await step('读取分支 GET /git/ref/heads/main', function () { return gh(repoPath('/git/ref/heads/' + BRANCH)); });
     await step('写权限 POST /git/blobs（空 blob，无副作用）', function () {
       return gh(repoPath('/git/blobs'), {
         method: 'POST', body: JSON.stringify({ content: 'Cg==', encoding: 'base64' })
@@ -832,6 +968,19 @@
   }
 
   // ---------- commit ----------
+  // 用 API 读取 main 当前 commit 里的 repo-meta.json，避免把浏览器旧快照写回仓库
+  async function fetchLatestMeta(parentSha) {
+    try {
+      var c = await gh(repoPath('/git/commits/' + parentSha));
+      var t = await gh(repoPath('/git/trees/' + c.tree.sha));
+      var entry = (t.tree || []).find(function (x) { return x.path === 'repo-meta.json'; });
+      if (!entry) return { plugins: {} };
+      var blob = await gh(repoPath('/git/blobs/' + entry.sha));
+      var obj = JSON.parse(b64ToUtf8(blob.content));
+      return obj && obj.plugins ? obj : { plugins: {} };
+    } catch (e) { return { plugins: {} }; }
+  }
+
   async function commit() {
     if (!state.pending.length) return toast('没有待提交的变更', true);
     var btn = $('btn-commit');
@@ -862,10 +1011,12 @@
           map[p.newPath] = { path: p.newPath, mode: '100644', type: 'blob', sha: p.sha };
         }
       });
-      if (state.metaDirty) {
+      if (hasEdits()) {
+        var latest = await fetchLatestMeta(parent);
+        var finalMeta = mergeMeta(latest, state.edits);
         map['repo-meta.json'] = {
           path: 'repo-meta.json', mode: '100644', type: 'blob',
-          sha: await blobFromText(JSON.stringify(state.meta, null, 2) + '\n')
+          sha: await blobFromText(JSON.stringify(finalMeta, null, 2) + '\n')
         };
       }
       var entries = Object.keys(map).map(function (k) { return map[k]; });
@@ -889,13 +1040,15 @@
 
       state.pending = [];
       state.commitError = '';
-      state.metaDirty = false;
+      state.edits = emptyEdits();
+      Object.keys(state.iconPreviews).forEach(function (k) { URL.revokeObjectURL(state.iconPreviews[k]); });
+      state.iconPreviews = {};
+      sessionStorage.removeItem('jbrm_state');
       await loadAll();
-      render();
-      toast('提交成功，索引与站点正在自动更新');
+      toast('提交成功，改动已生效；索引与站点正在自动更新');
     } catch (e) {
       state.commitError = e.message;
-      toast('提交失败：' + e.message, true);
+      toast('提交失败，改动未生效（仍保留在待提交）：' + e.message, true);
     } finally {
       if (btn) btn.disabled = false;
       render();
@@ -924,7 +1077,6 @@
       state.navDir = '';
       state.catFilter = null;
       await loadAll();
-      render();
       toast('已连接：' + u.login);
     } catch (e) {
       token = '';
@@ -936,11 +1088,10 @@
     localStorage.removeItem('jbrm_token');
     sessionStorage.removeItem('jbrm_token');
     token = '';
-    // 保留待提交改动与未提交的元数据，方便换 Token 后继续提交
     $('main').hidden = true;
     $('login').hidden = false;
     $('token').value = '';
-    setMsg('login-msg', '已断开');
+    setMsg('login-msg', '已断开（未提交改动仍保留）');
   }
 
   // ---------- bindings ----------
@@ -948,6 +1099,9 @@
   $('token').onkeydown = function (e) { if (e.key === 'Enter') connect(); };
   $('search').oninput = render;
   $('search-clear').onclick = function () { $('search').value = ''; render(); };
+  $('dirty-go').onclick = function () {
+    state.view = 'pending'; render(); window.scrollTo(0, 0);
+  };
 
   document.querySelectorAll('.tab').forEach(function (t) {
     t.onclick = function () {
@@ -961,35 +1115,39 @@
   });
 
   $('nav-back').onclick = function () {
-    if (state.view === 'dirs') {
-      state.navDir = dirname(state.navDir);
-    } else if (state.view === 'plugins') {
-      state.catFilter = null; // 回到分类目录列表
-    }
+    if (state.view === 'dirs') state.navDir = dirname(state.navDir);
+    else if (state.view === 'plugins') state.catFilter = null;
     $('search').value = ''; render();
   };
 
   $('nav-add').onclick = function () {
     if (state.view === 'pending') {
-      state.pending = []; rebuild(); render(); toast('已清空');
+      state.pending = []; state.edits = emptyEdits(); rebuild(); render(); toast('已清空');
     } else if (state.view === 'dirs') {
       openDialog('添加目录', '', state.navDir
-        ? '在 ' + state.navDir + '/ 下新建目录' : '在仓库根目录下新建目录', function (v) {
+        ? '在 ' + state.navDir + '/ 下新建目录（需提交才生效）' : '在仓库根目录下新建目录（需提交才生效）', function (v) {
         var d = cleanDir(v);
         if (!validDir(d)) return toast('目录名不合法', true);
         var full = (state.navDir ? state.navDir + '/' : '') + d;
         if (allDirs().indexOf(full) >= 0) return toast('目录已存在', true);
         addPending({ op: 'add', path: full + '/.gitkeep', text: '\n', note: '新建目录' });
-        toast('目录已加入待提交');
+        toast('已加入待提交，请点提交');
       });
     } else if (state.view === 'plugins') {
-      if (!state.catFilter) return addCategory(); // 分类列表页：添加目录
+      if (!state.catFilter) return addCategory();
       if (state.catFilter === '__all__') return uploadTo('debs', '未分类');
-      uploadTo('debs', state.catFilter);          // 分类内：上传插件并归入该分类
+      uploadTo('debs', state.catFilter);
     }
   };
 
   $('view-dirs').onclick = function (e) {
+    var img = e.target.closest('[data-icon]');
+    if (img) {
+      $('img-viewer-src').src = img.getAttribute('data-icon');
+      $('img-viewer-name').textContent = img.getAttribute('data-iconname');
+      $('img-viewer').hidden = false;
+      return;
+    }
     var menu = e.target.closest('[data-dirmenu]');
     if (menu) { e.stopPropagation(); return dirMenu(menu.getAttribute('data-dirmenu')); }
     var plugin = e.target.closest('[data-plugin]');
@@ -1019,6 +1177,11 @@
   $('view-pending').onclick = function (e) {
     var id = e.target.getAttribute('data-undo');
     if (id) removePending(id);
+  };
+
+  $('img-viewer-close').onclick = function () { $('img-viewer').hidden = true; };
+  $('img-viewer').onclick = function (e) {
+    if (e.target === $('img-viewer')) $('img-viewer').hidden = true;
   };
 
   $('sheet-actions').onclick = function (e) {

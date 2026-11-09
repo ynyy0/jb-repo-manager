@@ -31,6 +31,9 @@ jobs:
         run: |
           mkdir _site
           rsync -a --exclude='.git' --exclude='.github' ./ _site/
+          # 每次部署把 commit sha 注入静态资源 URL，浏览器自动拉新版、不留旧缓存
+          sed -i "s/__BUILD__/${GITHUB_SHA::7}/g" _site/index.html
+          grep -o 'app.js?v=[a-z0-9]*' _site/index.html
 
       - name: Upload site
         uses: actions/upload-pages-artifact@v3

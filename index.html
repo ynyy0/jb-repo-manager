@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#f2f3f5">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>与你有源 · 管理台</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=__BUILD__">
 </head>
 <body>
 
@@ -35,6 +36,11 @@
     <span class="nav-spacer"></span>
     <button id="nav-add" class="nav-btn add">+</button>
   </header>
+
+  <div class="dirty-bar" id="dirty-bar" hidden>
+    <span id="dirty-text">⚠ 有未提交改动</span>
+    <button id="dirty-go">去提交</button>
+  </div>
 
   <div class="search-wrap">
     <span class="search-ico">⌕</span>
@@ -88,7 +94,16 @@
 <input type="file" id="file-deb" accept=".deb" multiple hidden>
 <input type="file" id="file-icon" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
 
+<!-- 图标大图预览 -->
+<div id="img-viewer" class="mask img-viewer" hidden>
+  <div class="img-box">
+    <img id="img-viewer-src" src="" alt="">
+    <p id="img-viewer-name" class="hint"></p>
+    <button id="img-viewer-close" class="btn block">关闭</button>
+  </div>
+</div>
+
 <div id="toast" class="toast"></div>
-<script src="app.js"></script>
+<script src="app.js?v=__BUILD__"></script>
 </body>
 </html>
