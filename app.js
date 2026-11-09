@@ -9,65 +9,72 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var token = '';
-  var items = [];    // {path, sha, size}
-  var pending = [];  // {id, op, path, newPath, sha, file, size, note}
-  var seq = 0;
   var toastTimer = null;
+  var seq = 0;
 
+  var state = {
+    files: [],           // {path, sha, size}
+    iconIndex: {},       // lowercase path -> real path
+    index: { byFilename: {}, byPackage: {} },
+    meta: { plugins: {} },
+    metaDirty: false,
+    plugins: [],
+    dirs: [],
+    clipboard: null,
+    pending: [],
+    view: 'dirs',
+    dirFilter: null
+  };
+
+  // ---------- helpers ----------
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
-
   function fmtSize(n) {
     if (!n) return '0 B';
     if (n < 1024) return n + ' B';
     if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
     return (n / 1048576).toFixed(1) + ' MB';
   }
-
   function basename(p) { return p.slice(p.lastIndexOf('/') + 1); }
   function dirname(p) { var i = p.lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i); }
   function cleanDir(s) { return String(s || '').trim().replace(/^\/+|\/+$/g, ''); }
-
+  function validDir(s) { return !!s && !/[\\]/.test(s) && s.indexOf('..') < 0; }
+  function guessPackage(fn) {
+    var s = fn.replace(/\.deb$/i, '').replace(/_iphoneos-arm64e?$/i, '');
+    var i = s.lastIndexOf('_');
+    return i > 0 ? s.slice(0, i) : s;
+  }
+  function rawUrl(p) {
+    return 'https://raw.githubusercontent.com/' + OWNER + '/' + REPO + '/' + BRANCH + '/' +
+      p.split('/').map(encodeURIComponent).join('/');
+  }
   function toast(text, isErr) {
     var el = $('toast');
     el.textContent = text;
     el.className = 'toast show' + (isErr ? ' err' : '');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { el.className = 'toast'; }, 2800);
+    toastTimer = setTimeout(function () { el.className = 'toast'; }, 2600);
   }
-
-  function setMsg(id, text, isErr, isHtml) {
+  function setMsg(id, text, isErr) {
     var el = $(id);
     el.className = 'msg' + (isErr ? ' err' : (text ? ' ok' : ''));
-    if (isHtml) el.innerHTML = text; else el.textContent = text;
+    el.textContent = text;
   }
-
-  async function gh(path, opts) {
-    opts = opts || {};
-    var headers = {
-      'Authorization': 'Bearer ' + token,
-      'Accept': 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28'
-    };
-    if (opts.body) headers['Content-Type'] = 'application/json';
-    var r = await fetch(API + path, {
-      method: opts.method || 'GET',
-      headers: headers,
-      body: opts.body || undefined
-    });
-    if (!r.ok) {
-      var detail = '';
-      try { var j = await r.json(); detail = j.message || ''; } catch (e) { /* ignore */ }
-      throw new Error(r.status + ' ' + r.statusText + (detail ? ' — ' + detail : ''));
-    }
-    return r.status === 204 ? null : r.json();
+  function b64ToUtf8(b64) {
+    var bin = atob(String(b64).replace(/\s/g, ''));
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
   }
-
-  function repoPath(suffix) { return '/repos/' + OWNER + '/' + REPO + suffix; }
-
+  function textToBase64(s) {
+    var bytes = new TextEncoder().encode(s);
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
   function fileToBase64(file) {
     return new Promise(function (resolve, reject) {
       var fr = new FileReader();
@@ -77,212 +84,488 @@
     });
   }
 
-  // deb 文件名 -> 包名：com.foo_1.2_iphoneos-arm64.deb => com.foo
-  function guessPackage(fn) {
-    var s = fn.replace(/\.deb$/i, '').replace(/_iphoneos-arm64e?$/i, '');
-    var i = s.lastIndexOf('_');
-    return i > 0 ? s.slice(0, i) : s;
-  }
-
-  function allDirs() {
-    var set = {};
-    set[''] = 1;
-    items.forEach(function (i) { set[dirname(i.path)] = 1; });
-    pending.forEach(function (p) {
-      if (p.op === 'add') set[dirname(p.path)] = 1;
-      if (p.op === 'move') set[dirname(p.newPath)] = 1;
+  // ---------- GitHub API ----------
+  function repoPath(suffix) { return '/repos/' + OWNER + '/' + REPO + suffix; }
+  async function gh(path, opts) {
+    opts = opts || {};
+    var headers = {
+      'Authorization': 'Bearer ' + token,
+      'Accept': 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    };
+    if (opts.body) headers['Content-Type'] = 'application/json';
+    var r = await fetch(API + path, {
+      method: opts.method || 'GET', headers: headers, body: opts.body || undefined
     });
-    return Object.keys(set).sort();
+    if (!r.ok) {
+      var detail = '';
+      try { var j = await r.json(); detail = j.message || ''; } catch (e) { /* ignore */ }
+      throw new Error(r.status + ' ' + r.statusText + (detail ? ' — ' + detail : ''));
+    }
+    return r.status === 204 ? null : r.json();
   }
-
-  function setSelect(id, opts) {
-    var el = $(id);
-    var cur = el.value;
-    el.innerHTML = opts.map(function (o) {
-      return '<option value="' + esc(o.value) + '">' + esc(o.label) + '</option>';
-    }).join('');
-    if (opts.some(function (o) { return o.value === cur; })) el.value = cur;
-  }
-
-  function renderSelects() {
-    var dirOpts = allDirs().map(function (d) {
-      return { value: d, label: d === '' ? '（仓库根目录）' : d + '/' };
+  async function makeBlobFromBase64(b64) {
+    var r = await gh(repoPath('/git/blobs'), {
+      method: 'POST', body: JSON.stringify({ content: b64, encoding: 'base64' })
     });
-    setSelect('upload-dir', dirOpts);
-    setSelect('move-dir', dirOpts);
-    setSelect('rename-old', dirOpts.filter(function (o) { return o.value !== ''; }));
-    setSelect('move-file', items.map(function (i) {
-      return { value: i.path, label: i.path };
-    }));
+    return r.sha;
   }
+  async function blobFromText(s) { return makeBlobFromBase64(textToBase64(s)); }
 
-  function renderTree() {
-    var q = $('filter').value.trim().toLowerCase();
-    var groups = {};
-    items.forEach(function (i) {
-      if (q && i.path.toLowerCase().indexOf(q) < 0) return;
-      var d = dirname(i.path);
-      (groups[d] = groups[d] || []).push(i);
-    });
-    var keys = Object.keys(groups).sort();
-    var html = '';
-    keys.forEach(function (d) {
-      html += '<div class="dir">' + (d === '' ? '（根目录）' : esc(d) + '/') +
-        ' <span class="muted">· ' + groups[d].length + ' 个文件</span></div>';
-      groups[d].forEach(function (i) {
-        html += '<div class="filerow"><span class="name">' + esc(basename(i.path)) + '</span>' +
-          '<span class="sz">' + fmtSize(i.size) + '</span>' +
-          '<button class="mini" data-move="' + esc(i.path) + '">移动</button>' +
-          '<button class="mini del" data-del="' + esc(i.path) + '">删除</button></div>';
+  function parseIndex(text) {
+    var byFilename = {}, byPackage = {};
+    String(text).trim().split(/\n\s*\n/).forEach(function (block) {
+      var d = {};
+      block.split('\n').forEach(function (line) {
+        var i = line.indexOf(': ');
+        if (i > 0) d[line.slice(0, i)] = line.slice(i + 2);
       });
+      if (d.Package) {
+        byPackage[d.Package] = d;
+        if (d.Filename) byFilename[d.Filename] = d;
+      }
     });
-    $('tree').innerHTML = html || '<div class="item muted">没有匹配的文件</div>';
-    $('file-count').textContent = items.length + ' 个文件';
-    $('tree-summary').textContent = items.length + ' 个文件 · ' + (allDirs().length - 1) + ' 个目录';
+    return { byFilename: byFilename, byPackage: byPackage };
+  }
+
+  // ---------- data ----------
+  async function loadAll() {
+    toast('读取仓库…');
+    var ref = await gh(repoPath('/git/ref/heads/' + BRANCH));
+    var tree = await gh(repoPath('/git/trees/' + ref.object.sha + '?recursive=1'));
+    if (tree.truncated) toast('GitHub 文件树被截断，部分内容可能缺失', true);
+    state.files = tree.tree.filter(function (x) { return x.type === 'blob'; }).map(function (x) {
+      return { path: x.path, sha: x.sha, size: x.size || 0 };
+    });
+
+    state.iconIndex = {};
+    state.files.forEach(function (f) {
+      if (/\.(png|jpe?g|webp|gif)$/i.test(f.path)) state.iconIndex[f.path.toLowerCase()] = f.path;
+    });
+
+    try {
+      var r = await fetch(rawUrl('Packages') + '?t=' + Date.now(), { cache: 'no-store' });
+      if (r.ok) state.index = parseIndex(await r.text());
+    } catch (e) { /* 索引不可用时退化为文件名显示 */ }
+
+    var metaFile = state.files.find(function (f) { return f.path === 'repo-meta.json'; });
+    if (metaFile) {
+      try {
+        var blob = await gh(repoPath('/git/blobs/' + metaFile.sha));
+        var parsed = JSON.parse(b64ToUtf8(blob.content));
+        state.meta = parsed && parsed.plugins ? parsed : { plugins: {} };
+      } catch (e) { state.meta = { plugins: {} }; }
+    } else {
+      state.meta = { plugins: {} };
+    }
+    state.metaDirty = false;
+    rebuild();
+    toast('已加载 ' + state.plugins.length + ' 个插件');
+  }
+
+  function rebuild() {
+    var iconIndex = state.iconIndex;
+    var meta = state.meta.plugins || {};
+    state.plugins = state.files.filter(function (f) {
+      return /\.deb$/i.test(f.path);
+    }).map(function (f) {
+      var pkg = guessPackage(basename(f.path));
+      var info = state.index.byFilename[f.path] || state.index.byPackage[pkg] || {};
+      var ov = meta[pkg] || {};
+      var wantIcon = 'icons/' + pkg + '.png';
+      var localIcon = iconIndex[wantIcon.toLowerCase()] || null;
+      var icon = ov.icon || (localIcon ? localIcon :
+        (info.Icon && /^https?:/.test(info.Icon) ? info.Icon : 'CydiaIcon.png'));
+      return {
+        path: f.path, dir: dirname(f.path), sha: f.sha, size: f.size, pkg: pkg,
+        name: ov.name || info.Name || pkg,
+        version: info.Version || '',
+        desc: ov.description || info.Description || '',
+        section: info.Section || '',
+        icon: icon,
+        iconUrl: /^https?:/.test(icon) ? icon : rawUrl(icon),
+        iconPath: localIcon
+      };
+    });
+
+    var dset = {};
+    state.files.forEach(function (f) {
+      var d = dirname(f.path);
+      if (d && d !== '.github') dset[d] = 1;
+    });
+    state.pending.forEach(function (p) {
+      if (p.op === 'add') { var d = dirname(p.path); if (d) dset[d] = 1; }
+      if (p.op === 'move') { var d2 = dirname(p.newPath); if (d2) dset[d2] = 1; }
+    });
+    state.dirs = Object.keys(dset).sort();
+  }
+
+  function pluginsIn(dir) {
+    if (!dir) return state.plugins;
+    return state.plugins.filter(function (p) { return p.dir === dir; });
+  }
+  function dirCount(d) {
+    return state.plugins.filter(function (p) { return p.dir === d; }).length;
+  }
+  function findPlugin(path) {
+    return state.plugins.find(function (p) { return p.path === path; });
+  }
+
+  // ---------- pending ----------
+  function addPending(p) { p.id = ++seq; state.pending.push(p); rebuild(); render(); }
+  function removePending(id) {
+    state.pending = state.pending.filter(function (p) { return String(p.id) !== id; });
+    rebuild(); render();
+  }
+  function noteMeta(text) {
+    state.metaDirty = true;
+    addPending({ op: 'meta', text: text });
+  }
+
+  // ---------- rendering ----------
+  function render() {
+    var v = state.view;
+    $('view-dirs').hidden = v !== 'dirs';
+    $('view-plugins').hidden = v !== 'plugins';
+    $('view-pending').hidden = v !== 'pending';
+    $('view-me').hidden = v !== 'me';
+    $('nav-back').hidden = !(v === 'plugins' && state.dirFilter);
+    $('nav-add').hidden = (v === 'me' || v === 'pending');
+
+    var titles = { dirs: '目录', pending: '待提交', me: '连接' };
+    $('nav-title').textContent = v === 'plugins'
+      ? (state.dirFilter || '全部插件') : titles[v];
+    $('nav-add').textContent = '+';
+
+    var searchable = (v === 'dirs' || v === 'plugins');
+    $('search').parentNode.hidden = !searchable;
+    $('search').placeholder = v === 'dirs' ? '搜索目录' : '搜索插件';
+
+    document.querySelectorAll('.tab').forEach(function (t) {
+      t.classList.toggle('active', t.getAttribute('data-tab') === v);
+    });
+    var n = state.pending.length;
+    var badge = $('tab-badge');
+    badge.hidden = n === 0;
+    badge.textContent = n;
+
+    if (v === 'dirs') renderDirs();
+    if (v === 'plugins') renderPlugins();
+    if (v === 'pending') renderPending();
+    if (v === 'me') renderMe();
+  }
+
+  function renderDirs() {
+    var q = $('search').value.trim().toLowerCase();
+    var total = state.plugins.length;
+    var html = '<div class="section-title">插件目录 · 共 ' + state.dirs.length + ' 个</div><div class="list-card">';
+    html += '<div class="cell" data-open="__all__"><div class="cell-main"><div class="cell-name">全部插件</div>' +
+      '<div class="cell-sub">查看仓库里所有 .deb</div></div>' +
+      '<span class="cell-count">' + total + '</span><span class="chev">›</span></div>';
+    state.dirs.filter(function (d) { return !q || d.toLowerCase().indexOf(q) >= 0; }).forEach(function (d) {
+      html += '<div class="cell" data-open="' + esc(d) + '">' +
+        '<div class="cell-main"><div class="cell-name">' + esc(d) + '</div>' +
+        '<div class="cell-sub">' + dirCount(d) + ' 个插件 · ' +
+        state.files.filter(function (f) { return dirname(f.path) === d; }).length + ' 个文件</div></div>' +
+        '<span class="cell-count">' + dirCount(d) + '</span>' +
+        '<button class="cell-btn" data-dir="' + esc(d) + '" aria-label="目录选项">⋯</button>' +
+        '<span class="chev">›</span></div>';
+    });
+    html += '</div>';
+    if (state.clipboard) {
+      html += '<div class="card"><b>剪贴板：' + esc(state.clipboard.plugin.name) +
+        '</b><p class="hint">' + (state.clipboard.mode === 'copy' ? '复制' : '剪切') +
+        ' · 进入目标目录后点右上角 + 或在插件页选「粘贴到此目录」</p></div>';
+    }
+    html += '<div class="card"><b>提示</b><p class="hint">点目录行进入；点 ⋯ 可重命名、删除、上传或粘贴。' +
+      '只有 <code>debs/</code> 下的插件会出现在 APT 索引里。</p></div>';
+    $('view-dirs').innerHTML = html;
+  }
+
+  function renderPlugins() {
+    var q = $('search').value.trim().toLowerCase();
+    var list = pluginsIn(state.dirFilter).filter(function (p) {
+      return !q || (p.name + ' ' + p.pkg + ' ' + p.desc).toLowerCase().indexOf(q) >= 0;
+    });
+    var html = '<div class="section-title">' + (state.dirFilter || '全部插件') + ' · ' + list.length + ' 个插件</div>';
+    if (!list.length) {
+      html += '<div class="empty">这里还没有插件</div>';
+    } else {
+      html += '<div class="list-card">';
+      list.forEach(function (p) {
+        html += '<div class="plugin">' +
+          '<img class="picon" src="' + esc(p.iconUrl) + '" alt="" loading="lazy" ' +
+          'onerror="this.onerror=null;this.src=\'' + esc(rawUrl('CydiaIcon.png')) + '\'">' +
+          '<div class="pinfo"><div class="pname">' + esc(p.name) + '</div>' +
+          '<div class="pmeta">' + esc(p.version || p.pkg) + (p.section ? ' · ' + esc(p.section) : '') +
+          ' · ' + fmtSize(p.size) + '</div>' +
+          (p.desc ? '<div class="pdesc">' + esc(p.desc) + '</div>' : '') + '</div>' +
+          '<button class="pmore" data-plugin="' + esc(p.path) + '" aria-label="插件选项">⋯</button></div>';
+      });
+      html += '</div>';
+    }
+    $('view-plugins').innerHTML = html;
   }
 
   function renderPending() {
-    var n = pending.length;
-    $('pending-count').textContent = n;
-    $('pending-count2').textContent = n;
-    $('btn-commit').disabled = n === 0;
-    var label = { add: '上传', delete: '删除', move: '移动' };
-    var cls = { add: 'add', delete: 'del', move: 'mov' };
-    $('pending').innerHTML = n ? pending.map(function (p) {
-      var text = p.op === 'move' ? p.path + ' → ' + p.newPath : p.path;
-      return '<div class="item"><span class="tag ' + cls[p.op] + '">' + label[p.op] + '</span>' +
-        '<span class="name">' + esc(text) +
-        (p.note ? ' <span class="muted">(' + esc(p.note) + ')</span>' : '') + '</span>' +
-        '<span class="sz">' + (p.size ? fmtSize(p.size) : '') + '</span>' +
-        '<button class="mini del" data-undo="' + p.id + '">撤销</button></div>';
-    }).join('') : '<div class="item muted">还没有变更</div>';
+    var label = { add: '新增', delete: '删除', move: '移动', meta: '元数据' };
+    var cls = { add: 'add', delete: 'del', move: 'mov', meta: 'meta' };
+    var html = '<div class="stat"><div><b>' + state.plugins.length + '</b><span>插件</span></div>' +
+      '<div><b>' + state.dirs.length + '</b><span>目录</span></div>' +
+      '<div><b>' + state.pending.length + '</b><span>待提交</span></div></div>';
+    html += '<div class="section-title">待提交变更</div><div class="list-card">';
+    if (!state.pending.length) {
+      html += '<div class="empty">还没有改动</div>';
+    } else {
+      state.pending.forEach(function (p) {
+        var text = p.op === 'move' ? p.path + ' → ' + p.newPath : (p.text || p.path);
+        html += '<div class="change"><span class="tag ' + cls[p.op] + '">' + label[p.op] + '</span>' +
+          '<span class="txt">' + esc(text) +
+          (p.note ? '<small>' + esc(p.note) + '</small>' : '') + '</span>' +
+          '<button class="mini" data-undo="' + p.id + '">撤销</button></div>';
+      });
+    }
+    html += '</div>';
+    html += '<div class="commit-bar"><button id="btn-commit" class="btn primary block"' +
+      (state.pending.length ? '' : ' disabled') + '>提交更改（' + state.pending.length + '）</button>' +
+      '<button id="btn-clear" class="btn block"' + (state.pending.length ? '' : ' disabled') +
+      ' style="margin-top:9px">清空待提交</button>' +
+      '<p class="hint">所有变更合并为一次原子提交；提交后源仓库会自动刷新索引并部署。</p></div>';
+    $('view-pending').innerHTML = html;
+    $('btn-commit').onclick = commit;
+    $('btn-clear').onclick = function () {
+      state.pending = []; rebuild(); render(); toast('已清空');
+    };
   }
 
-  function renderAll() { renderSelects(); renderTree(); renderPending(); }
+  function renderMe() {
+    $('view-me').innerHTML =
+      '<div class="card"><b>当前连接</b><p class="hint">目标仓库：<code>' + OWNER + '/' + REPO +
+      '</code><br>分支：<code>' + BRANCH + '</code><br>管理台仓库：<code>ynyy0/jb-repo-manager</code></p>' +
+      '<div class="row" style="margin-top:14px"><button id="btn-refresh2" class="btn grow">刷新仓库</button>' +
+      '<button id="btn-logout" class="btn danger grow">断开</button></div></div>' +
+      '<div class="card"><b>使用说明</b><p class="hint">' +
+      '① 目录页点目录进入，点 ⋯ 管理目录；<br>' +
+      '② 插件页点 ⋯ 可改名、改图标、复制、剪切、移动、粘贴、删除；<br>' +
+      '③ 改名 / 改图标 / 上传等先进入「待提交」，确认后一次提交；<br>' +
+      '④ 单文件建议 ≤ 50 MB，移出 <code>debs/</code> 的插件不会被索引收录。</p></div>' +
+      '<div class="card"><b>关于 Token</b><p class="hint">只保存在本机浏览器，随请求直发 api.github.com，' +
+      '不写入仓库、不经过第三方。可随时「断开」清除。</p></div>';
+    $('btn-refresh2').onclick = function () {
+      loadAll().then(function () { render(); }).catch(function (e) { toast('刷新失败：' + e.message, true); });
+    };
+    $('btn-logout').onclick = logout;
+  }
 
-  async function loadTree() {
-    toast('读取仓库文件…');
-    var ref = await gh(repoPath('/git/ref/heads/' + BRANCH));
-    var t = await gh(repoPath('/git/trees/' + ref.object.sha + '?recursive=1'));
-    if (t.truncated) toast('GitHub 返回的文件树被截断，操作可能不完整', true);
-    items = t.tree.filter(function (x) { return x.type === 'blob'; }).map(function (x) {
-      return { path: x.path, sha: x.sha, size: x.size || 0 };
+  // ---------- sheets & dialogs ----------
+  var sheetActions = [];
+  function openSheet(title, actions) {
+    sheetActions = actions;
+    $('sheet-title').textContent = title;
+    $('sheet-actions').innerHTML = actions.map(function (a, i) {
+      return '<button class="' + (a.danger ? 'danger' : '') + '" data-act="' + i + '">' +
+        '<span class="si">' + (a.icon || '•') + '</span><span>' + esc(a.label) + '</span></button>';
+    }).join('');
+    $('sheet').hidden = false;
+  }
+  function closeSheet() { $('sheet').hidden = true; }
+
+  var dialogCb = null;
+  function openDialog(title, value, hint, cb) {
+    dialogCb = cb;
+    $('dialog-title').textContent = title;
+    $('dialog-hint').textContent = hint || '';
+    $('dialog-input').value = value || '';
+    $('dialog').hidden = false;
+    setTimeout(function () { $('dialog-input').focus(); }, 50);
+  }
+  function closeDialog() { $('dialog').hidden = true; dialogCb = null; }
+
+  function pickDir(title, cb) {
+    var opts = state.dirs.slice();
+    if (state.dirFilter) opts = opts.filter(function (d) { return d !== state.dirFilter; });
+    var actions = opts.map(function (d) {
+      return { label: d + '/', icon: '▸', fn: function () { cb(d); } };
     });
-    renderAll();
-    toast('已加载 ' + items.length + ' 个文件');
-  }
-
-  function addDelete(path) {
-    var it = items.find(function (x) { return x.path === path; });
-    if (!it) return;
-    if (pending.some(function (p) { return p.path === path && p.op === 'delete'; })) {
-      return toast('这个文件已经在待删除列表里', true);
-    }
-    pending.push({ id: ++seq, op: 'delete', path: path, size: it.size });
-    if (path.indexOf('debs/') === 0 && /\.deb$/i.test(path)) {
-      var iconPath = 'icons/' + guessPackage(basename(path)) + '.png';
-      var icon = items.find(function (x) { return x.path.toLowerCase() === iconPath.toLowerCase(); });
-      if (icon && !pending.some(function (p) { return p.path === icon.path && p.op === 'delete'; })) {
-        pending.push({ id: ++seq, op: 'delete', path: icon.path, size: icon.size, note: '联动图标' });
-      }
-    }
-    renderAll();
-  }
-
-  function addMove() {
-    var src = $('move-file').value;
-    var destDir = $('move-dir').value;
-    if (!src) return toast('请先选择要移动的文件', true);
-    var it = items.find(function (x) { return x.path === src; });
-    if (!it) return toast('文件不存在，请先刷新', true);
-    var dest = (destDir ? destDir + '/' : '') + basename(src);
-    if (dest === src) return toast('目标位置与原位置相同', true);
-    pending.push({ id: ++seq, op: 'move', path: src, newPath: dest, sha: it.sha, size: it.size });
-
-    if ($('move-icon').checked && /\.deb$/i.test(src)) {
-      var sibling = dirname(src) + '/' + guessPackage(basename(src)) + '.png';
-      var ic = items.find(function (x) { return x.path === sibling; });
-      if (ic && !pending.some(function (p) { return p.path === ic.path; })) {
-        pending.push({
-          id: ++seq, op: 'move', path: ic.path,
-          newPath: (destDir ? destDir + '/' : '') + basename(ic.path),
-          sha: ic.sha, size: ic.size, note: '同名图标'
+    actions.push({ label: '（仓库根目录）', icon: '▸', fn: function () { cb(''); } });
+    actions.push({
+      label: '新建目录…', icon: '+', fn: function () {
+        openDialog('新建目录', '', '输入新目录名', function (v) {
+          var d = cleanDir(v);
+          if (!validDir(d)) return toast('目录名不合法', true);
+          addPending({ op: 'add', path: d + '/.gitkeep', text: '\n', note: '新建目录' });
+          cb(d);
         });
       }
+    });
+    openSheet(title, actions);
+  }
+
+  // ---------- plugin actions ----------
+  function pluginMenu(path) {
+    var p = findPlugin(path);
+    if (!p) return;
+    var actions = [
+      { label: '改名', icon: '✎', fn: function () {
+        openDialog('修改插件名称', p.name, '显示名会覆盖 APT 索引里的 Name', function (v) {
+          v = String(v).trim();
+          if (!v || v === p.name) return;
+          state.meta.plugins = state.meta.plugins || {};
+          state.meta.plugins[p.pkg] = state.meta.plugins[p.pkg] || {};
+          state.meta.plugins[p.pkg].name = v;
+          noteMeta(p.name + ' → ' + v + '（改名）');
+          toast('已加入待提交');
+        });
+      } },
+      { label: '改图标', icon: '▣', fn: function () { changeIcon(p); } },
+      { label: '复制', icon: '⧉', fn: function () {
+        state.clipboard = { mode: 'copy', plugin: p };
+        render(); toast('已复制「' + p.name + '」');
+      } },
+      { label: '剪切', icon: '✂', fn: function () {
+        state.clipboard = { mode: 'cut', plugin: p };
+        render(); toast('已剪切「' + p.name + '」');
+      } },
+      { label: '移动到…', icon: '⇢', fn: function () {
+        pickDir('移动到哪个目录', function (d) { movePlugin(p, d); });
+      } },
+      { label: '粘贴到此目录', icon: '⎘', fn: function () {
+        pasteTo(state.dirFilter || 'debs');
+      } },
+      { label: '删除', icon: '✕', danger: true, fn: function () { deletePlugin(p); } }
+    ];
+    openSheet(p.name, actions);
+  }
+
+  function changeIcon(p) {
+    var input = $('file-icon');
+    input.value = '';
+    input.onchange = function (e) {
+      var f = e.target.files && e.target.files[0];
+      if (!f) return;
+      if (f.size > MAX_BYTES) return toast('图片过大', true);
+      addPending({
+        op: 'add', path: 'icons/' + p.pkg + '.png', file: f,
+        size: f.size, note: '改图标 · ' + p.name
+      });
+      p.iconUrl = URL.createObjectURL(f);
+      render();
+      toast('新图标已加入待提交');
+    };
+    input.click();
+  }
+
+  function deletePlugin(p) {
+    addPending({ op: 'delete', path: p.path, size: p.size, note: p.name });
+    if (p.iconPath && !state.pending.some(function (x) { return x.path === p.iconPath && x.op === 'delete'; })) {
+      addPending({ op: 'delete', path: p.iconPath, note: '联动图标（可单独撤销）' });
     }
-    renderAll();
     toast('已加入待提交');
   }
 
-  function renameDir() {
-    var oldD = $('rename-old').value;
-    var newD = cleanDir($('rename-new').value);
-    if (!oldD || !newD) return toast('请选择原目录并填写新名称', true);
-    if (oldD === newD) return toast('目录名没有变化', true);
-    if (/\\/.test(newD) || newD.indexOf('..') >= 0) return toast('目录名不合法', true);
-    var affected = items.filter(function (i) { return i.path.indexOf(oldD + '/') === 0; });
-    if (!affected.length) return toast('该目录下没有文件', true);
-    affected.forEach(function (i) {
-      pending.push({
-        id: ++seq, op: 'move', path: i.path,
-        newPath: newD + i.path.slice(oldD.length), sha: i.sha,
-        size: i.size, note: '目录重命名'
-      });
-    });
-    renderAll();
-    toast('已加入 ' + affected.length + ' 个文件的移动');
+  function movePlugin(p, destDir) {
+    var dest = (destDir ? destDir + '/' : '') + basename(p.path);
+    if (dest === p.path) return toast('目标与原位置相同', true);
+    addPending({ op: 'move', path: p.path, newPath: dest, sha: p.sha, size: p.size, note: p.name });
+    toast('已加入待提交');
   }
 
-  async function handleFiles(fileList) {
-    var raw = cleanDir($('new-dir').value) || $('upload-dir').value || '';
-    if (/\\/.test(raw) || raw.indexOf('..') >= 0) return toast('目录名不合法', true);
-    var files = Array.prototype.slice.call(fileList || []);
-    if (!files.length) return;
-    for (var k = 0; k < files.length; k++) {
-      var f = files[k];
-      if (f.size > MAX_BYTES) { toast(f.name + ' 超过 50 MB，已跳过', true); continue; }
-      var name = String(f.name || 'file').replace(/[\\/]/g, '_');
-      var path = (raw ? raw + '/' : '') + name;
-      pending = pending.filter(function (p) { return !(p.path === path && p.op === 'add'); });
-      pending.push({
-        id: ++seq, op: 'add', path: path, file: f, size: f.size,
-        note: items.some(function (i) { return i.path === path; }) ? '覆盖已有' : ''
-      });
+  function pasteTo(destDir) {
+    var c = state.clipboard;
+    if (!c) return toast('剪贴板是空的', true);
+    var p = c.plugin;
+    var dest = (destDir ? destDir + '/' : '') + basename(p.path);
+    if (c.mode === 'cut') {
+      if (dest === p.path) return toast('目标与原位置相同', true);
+      addPending({ op: 'move', path: p.path, newPath: dest, sha: p.sha, size: p.size, note: '剪切粘贴' });
+    } else {
+      if (dest === p.path) return toast('不能粘贴到原位置', true);
+      addPending({ op: 'add', path: dest, sha: p.sha, size: p.size, note: '复制自 ' + p.name });
     }
-    $('file-input').value = '';
-    renderAll();
-    toast('已加入 ' + files.length + ' 个文件，点「提交更改」后才写入仓库');
+    state.clipboard = null;
+    render();
+    toast('已粘贴到 ' + (destDir || '根目录'));
   }
 
-  function summarize(ps) {
-    var n = { add: 0, delete: 0, move: 0 };
-    ps.forEach(function (p) { n[p.op]++; });
-    return 'upload ' + n.add + ', delete ' + n.delete + ', move ' + n.move;
-  }
-
-  async function commit() {
-    if (!pending.length) return toast('没有待提交的变更', true);
-    var btn = $('btn-commit');
-    btn.disabled = true;
-    setMsg('commit-msg', '正在提交…', false);
-    try {
-      for (var i = 0; i < pending.length; i++) {
-        var p = pending[i];
-        if (p.op === 'add' && p.file && !p.sha) {
-          toast('上传 ' + basename(p.path) + ' …');
-          var b64 = await fileToBase64(p.file);
-          var blob = await gh(repoPath('/git/blobs'), {
-            method: 'POST',
-            body: JSON.stringify({ content: b64, encoding: 'base64' })
+  // ---------- directory actions ----------
+  function dirMenu(d) {
+    var actions = [
+      { label: '重命名目录', icon: '✎', fn: function () {
+        openDialog('重命名目录', d, '该目录下全部文件会一起移动', function (v) {
+          var nd = cleanDir(v);
+          if (!validDir(nd) || nd === d) return toast('目录名不合法或未变化', true);
+          var affected = state.files.filter(function (f) { return f.path.indexOf(d + '/') === 0; });
+          if (!affected.length) return toast('该目录下没有文件', true);
+          affected.forEach(function (f) {
+            addPending({
+              op: 'move', path: f.path, newPath: nd + f.path.slice(d.length),
+              sha: f.sha, size: f.size, note: '目录重命名'
+            });
           });
-          p.sha = blob.sha;
+          toast('已加入 ' + affected.length + ' 个移动');
+        });
+      } },
+      { label: '在此上传插件', icon: '↑', fn: function () { uploadTo(d); } },
+      { label: '粘贴插件到此', icon: '⎘', fn: function () { pasteTo(d); } },
+      { label: '删除目录', icon: '✕', danger: true, fn: function () {
+        var affected = state.files.filter(function (f) { return f.path.indexOf(d + '/') === 0; });
+        if (!affected.length) return toast('该目录下没有文件', true);
+        openDialog('删除目录', '', '将删除 ' + d + '/ 下 ' + affected.length +
+          ' 个文件，输入目录名确认', function (v) {
+          if (String(v).trim() !== d) return toast('输入的目录名不一致，已取消', true);
+          affected.forEach(function (f) {
+            addPending({ op: 'delete', path: f.path, size: f.size, note: '删除目录' });
+          });
+          toast('已加入 ' + affected.length + ' 个删除');
+        });
+      } }
+    ];
+    openSheet(d + '/', actions);
+  }
+
+  function uploadTo(dir) {
+    var input = $('file-deb');
+    input.value = '';
+    input.onchange = function (e) {
+      var files = Array.prototype.slice.call(e.target.files || []);
+      if (!files.length) return;
+      var skipped = 0;
+      files.forEach(function (f) {
+        if (f.size > MAX_BYTES) { skipped++; return; }
+        var name = String(f.name || 'file').replace(/[\\/]/g, '_');
+        addPending({
+          op: 'add', path: (dir ? dir + '/' : '') + name, file: f,
+          size: f.size, note: '上传插件'
+        });
+      });
+      if (skipped) toast(skipped + ' 个文件超过 50 MB 已跳过', true);
+      else toast('已加入 ' + files.length + ' 个插件');
+    };
+    input.click();
+  }
+
+  // ---------- commit ----------
+  async function commit() {
+    if (!state.pending.length) return toast('没有待提交的变更', true);
+    var btn = $('btn-commit');
+    if (btn) btn.disabled = true;
+    toast('正在提交…');
+    try {
+      for (var i = 0; i < state.pending.length; i++) {
+        var p = state.pending[i];
+        if (p.op !== 'add' || p.sha) continue;
+        if (p.file) {
+          toast('上传 ' + basename(p.path) + ' …');
+          p.sha = await makeBlobFromBase64(await fileToBase64(p.file));
+        } else if (p.text != null) {
+          p.sha = await blobFromText(p.text);
         }
       }
 
       var ref = await gh(repoPath('/git/ref/heads/' + BRANCH));
       var parent = ref.object.sha;
       var map = {};
-      pending.forEach(function (p) {
+      state.pending.forEach(function (p) {
         if (p.op === 'add') {
           map[p.path] = { path: p.path, mode: '100644', type: 'blob', sha: p.sha };
         } else if (p.op === 'delete') {
@@ -292,51 +575,52 @@
           map[p.newPath] = { path: p.newPath, mode: '100644', type: 'blob', sha: p.sha };
         }
       });
+      if (state.metaDirty) {
+        map['repo-meta.json'] = {
+          path: 'repo-meta.json', mode: '100644', type: 'blob',
+          sha: await blobFromText(JSON.stringify(state.meta, null, 2) + '\n')
+        };
+      }
       var entries = Object.keys(map).map(function (k) { return map[k]; });
+      var n = { add: 0, delete: 0, move: 0, meta: 0 };
+      state.pending.forEach(function (p) { n[p.op]++; });
 
       var tree = await gh(repoPath('/git/trees'), {
-        method: 'POST',
-        body: JSON.stringify({ base_tree: parent, tree: entries })
+        method: 'POST', body: JSON.stringify({ base_tree: parent, tree: entries })
       });
       var c = await gh(repoPath('/git/commits'), {
         method: 'POST',
         body: JSON.stringify({
-          message: 'Web console: ' + summarize(pending),
-          tree: tree.sha,
-          parents: [parent]
+          message: 'Web console: add ' + n.add + ', delete ' + n.delete +
+            ', move ' + n.move + ', meta ' + n.meta,
+          tree: tree.sha, parents: [parent]
         })
       });
       await gh(repoPath('/git/refs/heads/' + BRANCH), {
-        method: 'PATCH',
-        body: JSON.stringify({ sha: c.sha, force: false })
+        method: 'PATCH', body: JSON.stringify({ sha: c.sha, force: false })
       });
 
-      var url = 'https://github.com/' + OWNER + '/' + REPO + '/commit/' + c.sha;
-      setMsg('commit-msg',
-        '提交成功，源仓库的 workflow 会自动刷新索引并上线。 <a href="' + url +
-        '" target="_blank" rel="noopener">查看提交 ↗</a>', false, true);
-      pending = [];
-      await loadTree();
-      toast('提交完成');
+      state.pending = [];
+      state.clipboard = null;
+      await loadAll();
+      render();
+      toast('提交成功，索引与站点正在自动更新');
     } catch (e) {
-      setMsg('commit-msg', '提交失败：' + e.message, true);
       toast('提交失败：' + e.message, true);
     } finally {
-      btn.disabled = false;
-      renderPending();
+      if (btn) btn.disabled = false;
+      render();
     }
   }
 
+  // ---------- auth ----------
   async function connect() {
     var t = $('token').value.trim();
-    if (!t) return setMsg('auth-msg', '请先填写 Personal Access Token', true);
+    if (!t) return setMsg('login-msg', '请填写 Token', true);
     token = t;
-    setMsg('auth-msg', '正在验证…');
+    setMsg('login-msg', '正在验证…');
     try {
       var u = await gh('/user');
-      $('who').innerHTML = '已连接：<b>' + esc(u.login) + '</b> ' +
-        '<button class="mini" id="btn-logout">断开</button>';
-      $('btn-logout').onclick = logout;
       if ($('remember').checked) {
         localStorage.setItem('jbrm_token', t);
         sessionStorage.removeItem('jbrm_token');
@@ -344,13 +628,17 @@
         sessionStorage.setItem('jbrm_token', t);
         localStorage.removeItem('jbrm_token');
       }
-      $('auth-card').hidden = true;
-      $('app').hidden = false;
-      setMsg('auth-msg', '');
-      await loadTree();
+      $('login').hidden = true;
+      $('main').hidden = false;
+      setMsg('login-msg', '');
+      state.view = 'dirs';
+      state.dirFilter = null;
+      await loadAll();
+      render();
+      toast('已连接：' + u.login);
     } catch (e) {
       token = '';
-      setMsg('auth-msg', '连接失败：' + e.message, true);
+      setMsg('login-msg', '连接失败：' + e.message, true);
     }
   }
 
@@ -358,53 +646,91 @@
     localStorage.removeItem('jbrm_token');
     sessionStorage.removeItem('jbrm_token');
     token = '';
-    items = [];
-    pending = [];
-    $('app').hidden = true;
-    $('auth-card').hidden = false;
-    $('who').textContent = '';
+    state.pending = [];
+    state.clipboard = null;
+    $('main').hidden = true;
+    $('login').hidden = false;
     $('token').value = '';
-    setMsg('auth-msg', '已断开');
+    setMsg('login-msg', '已断开');
   }
 
-  // ---- bindings ----
+  // ---------- bindings ----------
   $('btn-connect').onclick = connect;
   $('token').onkeydown = function (e) { if (e.key === 'Enter') connect(); };
-  $('btn-refresh').onclick = function () {
-    loadTree().catch(function (e) { toast('刷新失败：' + e.message, true); });
-  };
-  $('btn-clear').onclick = function () { pending = []; renderPending(); };
-  $('btn-commit').onclick = commit;
-  $('btn-rename').onclick = renameDir;
-  $('btn-move').onclick = addMove;
-  $('filter').oninput = renderTree;
+  $('search').oninput = render;
+  $('search-clear').onclick = function () { $('search').value = ''; render(); };
 
-  $('tree').onclick = function (e) {
-    var del = e.target.getAttribute('data-del');
-    var mv = e.target.getAttribute('data-move');
-    if (del) addDelete(del);
-    if (mv) {
-      renderSelects();
-      $('move-file').value = mv;
-      toast('已选中 ' + basename(mv) + '，请选择目标目录');
+  document.querySelectorAll('.tab').forEach(function (t) {
+    t.onclick = function () {
+      state.view = t.getAttribute('data-tab');
+      if (state.view === 'plugins' && !state.dirFilter) { /* 全部插件 */ }
+      $('search').value = '';
+      render();
+      window.scrollTo(0, 0);
+    };
+  });
+
+  $('nav-back').onclick = function () {
+    state.view = 'dirs'; state.dirFilter = null;
+    $('search').value = ''; render();
+  };
+  $('nav-add').onclick = function () {
+    if (state.view === 'pending') {
+      state.pending = []; rebuild(); render(); toast('已清空');
+    } else if (state.view === 'dirs') {
+      openDialog('新建目录', '', '输入目录名（可在其中放插件）', function (v) {
+        var d = cleanDir(v);
+        if (!validDir(d)) return toast('目录名不合法', true);
+        if (state.dirs.indexOf(d) >= 0) return toast('目录已存在', true);
+        addPending({ op: 'add', path: d + '/.gitkeep', text: '\n', note: '新建目录' });
+        toast('目录已加入待提交');
+      });
+    } else if (state.view === 'plugins') {
+      uploadTo(state.dirFilter || 'debs');
     }
   };
-  $('pending').onclick = function (e) {
-    var id = e.target.getAttribute('data-undo');
-    if (!id) return;
-    pending = pending.filter(function (p) { return String(p.id) !== id; });
-    renderPending();
+
+  $('view-dirs').onclick = function (e) {
+    var dirBtn = e.target.getAttribute('data-dir');
+    if (dirBtn) { e.stopPropagation(); return dirMenu(dirBtn); }
+    var cell = e.target.closest('[data-open]');
+    if (!cell) return;
+    var v = cell.getAttribute('data-open');
+    state.dirFilter = v === '__all__' ? null : v;
+    state.view = 'plugins';
+    $('search').value = '';
+    render();
+    window.scrollTo(0, 0);
   };
 
-  $('drop').onclick = function () { $('file-input').click(); };
-  $('drop').ondragover = function (e) { e.preventDefault(); $('drop').classList.add('over'); };
-  $('drop').ondragleave = function () { $('drop').classList.remove('over'); };
-  $('drop').ondrop = function (e) {
-    e.preventDefault();
-    $('drop').classList.remove('over');
-    handleFiles(e.dataTransfer.files);
+  $('view-plugins').onclick = function (e) {
+    var path = e.target.getAttribute('data-plugin');
+    if (path) pluginMenu(path);
   };
-  $('file-input').onchange = function (e) { handleFiles(e.target.files); };
+
+  $('view-pending').onclick = function (e) {
+    var id = e.target.getAttribute('data-undo');
+    if (id) removePending(id);
+  };
+
+  $('sheet-actions').onclick = function (e) {
+    var btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    var a = sheetActions[Number(btn.getAttribute('data-act'))];
+    closeSheet();
+    if (a && a.fn) setTimeout(a.fn, 30);
+  };
+  $('sheet-cancel').onclick = closeSheet;
+  $('sheet').onclick = function (e) { if (e.target === $('sheet')) closeSheet(); };
+  $('dialog-cancel').onclick = closeDialog;
+  $('dialog-ok').onclick = function () {
+    var v = $('dialog-input').value;
+    var cb = dialogCb;
+    closeDialog();
+    if (cb) cb(v);
+  };
+  $('dialog-input').onkeydown = function (e) { if (e.key === 'Enter') $('dialog-ok').click(); };
+  $('dialog').onclick = function (e) { if (e.target === $('dialog')) closeDialog(); };
 
   var saved = localStorage.getItem('jbrm_token') || sessionStorage.getItem('jbrm_token');
   if (saved) { $('token').value = saved; connect(); }

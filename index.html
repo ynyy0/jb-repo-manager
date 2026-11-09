@@ -2,102 +2,91 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>越狱源管理台</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#f2f3f5">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>与你有源 · 管理台</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="top">
-  <div>
-    <h1>越狱源管理台</h1>
-    <p class="sub">管理 <code id="repo-name">ynyy0/ynyy0.github.io</code> 的插件与目录，所有改动合并为一次原子提交</p>
+
+<!-- 连接 -->
+<div id="login" class="screen login">
+  <div class="login-logo">源</div>
+  <h1>与你有源 · 管理台</h1>
+  <p class="login-sub">管理插件与目录 · 手机端</p>
+  <div class="card">
+    <label class="lbl">GitHub Personal Access Token</label>
+    <input type="password" id="token" class="inp" placeholder="github_pat_… / ghp_…" autocomplete="off" spellcheck="false">
+    <p class="hint">需要 <b>ynyy0/ynyy0.github.io</b> 的 <b>Contents: Read &amp; Write</b>。Token 只存在本机浏览器，直连 api.github.com。</p>
+    <label class="chk"><input type="checkbox" id="remember" checked> 记住这台设备</label>
+    <button id="btn-connect" class="btn primary block">连接</button>
+    <div id="login-msg" class="msg"></div>
+    <a class="link" href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener">生成 fine-grained PAT ↗</a>
   </div>
-  <div id="who" class="who"></div>
-</header>
+</div>
 
-<section class="card" id="auth-card">
-  <h2>连接 GitHub</h2>
-  <p class="hint">需要一个对 <b>ynyy0/ynyy0.github.io</b> 有 <b>Contents: Read &amp; Write</b> 权限的 Personal Access Token。Token 只保存在你本机浏览器，不会写进仓库或发送到第三方。</p>
-  <div class="row">
-    <input type="password" id="token" class="grow" placeholder="github_pat_… 或 ghp_…" autocomplete="off" spellcheck="false">
-    <button id="btn-connect" class="primary">连接</button>
-  </div>
-  <div class="row small">
-    <label><input type="checkbox" id="remember" checked> 记住这台设备</label>
-    <span class="grow"></span>
-    <a href="https://github.com/settings/personal-access-tokens" target="_blank" rel="noopener">生成 fine-grained PAT ↗</a>
-  </div>
-  <div id="auth-msg" class="msg"></div>
-</section>
+<!-- 主界面 -->
+<div id="main" class="screen" hidden>
+  <header class="nav">
+    <button id="nav-back" class="nav-btn" hidden>‹</button>
+    <span class="nav-spacer"></span>
+    <h1 id="nav-title">目录</h1>
+    <span class="nav-spacer"></span>
+    <button id="nav-add" class="nav-btn add">+</button>
+  </header>
 
-<main id="app" hidden>
-  <div class="card toolbar">
-    <button id="btn-refresh">刷新仓库</button>
-    <span id="tree-summary" class="hint"></span>
-    <span class="grow"></span>
-    <button id="btn-clear">清空待提交</button>
-    <button id="btn-commit" class="primary">提交更改（<span id="pending-count">0</span>）</button>
+  <div class="search-wrap">
+    <span class="search-ico">⌕</span>
+    <input id="search" type="search" placeholder="搜索插件" autocomplete="off">
+    <button id="search-clear" class="search-clear" hidden>×</button>
   </div>
 
-  <div class="grid">
-    <div class="col">
-      <section class="card">
-        <h2>上传文件</h2>
-        <div id="drop" class="drop">拖拽 <b>.deb</b> / 图片到这里，或点击选择文件</div>
-        <input type="file" id="file-input" multiple hidden>
-        <div class="row small">
-          <label class="grow">目标目录
-            <select id="upload-dir" class="full"></select>
-          </label>
-          <label class="grow">或新建目录
-            <input id="new-dir" class="full" placeholder="例如：beta">
-          </label>
-        </div>
-        <div id="upload-list" class="list"></div>
-        <p class="hint">单个文件建议 ≤ 50 MB。上传 <code>.deb</code> 请放 <code>debs/</code>，图标请放 <code>icons/</code> 并命名为 <code>{包名}.png</code>。</p>
-      </section>
+  <div id="view-dirs" class="view"></div>
+  <div id="view-plugins" class="view" hidden></div>
+  <div id="view-pending" class="view" hidden></div>
+  <div id="view-me" class="view" hidden></div>
 
-      <section class="card">
-        <h2>重命名目录</h2>
-        <div class="row small">
-          <select id="rename-old" class="grow"></select>
-          <span>→</span>
-          <input id="rename-new" class="grow" placeholder="新目录名">
-          <button id="btn-rename">加入待提交</button>
-        </div>
-        <p class="hint">会移动该目录下全部文件。重命名 <code>debs/</code> 会让 APT 索引扫不到插件，请谨慎。</p>
-      </section>
+  <nav class="tabbar">
+    <button class="tab active" data-tab="dirs">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg><span>目录</span>
+    </button>
+    <button class="tab" data-tab="plugins">
+      <svg viewBox="0 0 24 24"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/></svg><span>全部插件</span>
+    </button>
+    <button class="tab" data-tab="pending">
+      <svg viewBox="0 0 24 24"><path d="M12 16V4m0 0l-5 5m5-5l5 5M4 18v2h16v-2"/></svg><span>待提交<i id="tab-badge" class="badge" hidden>0</i></span>
+    </button>
+    <button class="tab" data-tab="me">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/></svg><span>连接</span>
+    </button>
+  </nav>
+</div>
 
-      <section class="card">
-        <h2>移动插件</h2>
-        <div class="row small">
-          <select id="move-file" class="grow"></select>
-          <span>→</span>
-          <select id="move-dir" class="grow"></select>
-          <button id="btn-move">加入待提交</button>
-        </div>
-        <label class="small"><input type="checkbox" id="move-icon" checked> 同时移动同目录下的同名图标（若存在）</label>
-        <p class="hint">移出 <code>debs/</code> 的包不会被 <code>release.yml</code> 收录。</p>
-      </section>
-    </div>
+<!-- 动作面板 -->
+<div id="sheet" class="mask" hidden>
+  <div class="sheet">
+    <div id="sheet-title" class="sheet-title"></div>
+    <div id="sheet-actions" class="sheet-actions"></div>
+    <button id="sheet-cancel" class="sheet-cancel">取消</button>
+  </div>
+</div>
 
-    <div class="col">
-      <section class="card">
-        <h2>仓库文件 <span id="file-count" class="badge"></span></h2>
-        <div class="row small">
-          <input id="filter" class="grow" placeholder="筛选文件名…">
-        </div>
-        <div id="tree" class="tree"></div>
-      </section>
-
-      <section class="card">
-        <h2>待提交变更 <span id="pending-count2" class="badge"></span></h2>
-        <div id="pending" class="list"></div>
-        <div id="commit-msg" class="msg"></div>
-      </section>
+<!-- 输入弹窗 -->
+<div id="dialog" class="mask dialog-mask" hidden>
+  <div class="dialog">
+    <h3 id="dialog-title"></h3>
+    <p id="dialog-hint" class="hint"></p>
+    <input id="dialog-input" class="inp" type="text" autocomplete="off">
+    <div class="row">
+      <button id="dialog-cancel" class="btn grow">取消</button>
+      <button id="dialog-ok" class="btn primary grow">确定</button>
     </div>
   </div>
-</main>
+</div>
+
+<input type="file" id="file-deb" accept=".deb" multiple hidden>
+<input type="file" id="file-icon" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
 
 <div id="toast" class="toast"></div>
 <script src="app.js"></script>
