@@ -574,8 +574,11 @@
       '<div><b>' + categories().length + '</b><span>分类</span></div>' +
       '<div><b>' + state.pending.length + '</b><span>待提交</span></div></div>';
     html += '<div class="card"><b>⚠ 这些改动还没生效</b><p class="hint">' +
-      '下面的改动只是本地预览，只有点「提交更改」写入仓库后才会真正生效、并触发源索引刷新。' +
-      '提交失败时改动会保留，可重试；也可点「清除本地缓存」丢弃全部未提交改动。</p></div>';
+      '下面的改动只是本地预览，只有点「提交更改」写入仓库后才会真正生效。' +
+      '提交后源仓库会自动刷索引并重新部署站点（约 2-5 分钟，图标和分类在部署完成后才会变化）。' +
+      '提交失败时改动会保留，可重试；也可点「清除本地缓存」丢弃全部未提交改动。</p>' +
+      '<a class="link" href="https://github.com/ynyy0/ynyy0.github.io/actions/workflows/deploy-pages.yml" ' +
+      'target="_blank" rel="noopener">查看站点部署进度 ↗</a></div>';
     html += '<div class="section-title">待提交变更</div><div class="list-card">';
     if (!state.pending.length) {
       html += '<div class="empty">还没有改动</div>';
@@ -1045,7 +1048,7 @@
       state.iconPreviews = {};
       sessionStorage.removeItem('jbrm_state');
       await loadAll();
-      toast('提交成功，改动已生效；索引与站点正在自动更新');
+      toast('已写入仓库；站点部署约需 2-5 分钟，之后图标和索引才会更新', false);
     } catch (e) {
       state.commitError = e.message;
       toast('提交失败，改动未生效（仍保留在待提交）：' + e.message, true);
