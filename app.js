@@ -19,13 +19,11 @@
     meta: { plugins: {} },
     metaDirty: false,
     plugins: [],
-    dirs: [],
-    clipboard: null,
     pending: [],
     commitError: '',
     view: 'dirs',
-    dirFilter: null,
-    catFilter: null
+    navDir: '',          // 目录页当前浏览路径（'' = 仓库根）
+    catFilter: null      // null = 分类列表；'__all__' = 全部插件；其它 = 某分类
   };
 
   // ---------- helpers ----------
@@ -134,7 +132,10 @@
       });
       if (d.Package) {
         byPackage[d.Package] = d;
-        if (d.Filename) byFilename[d.Filename] = d;
+        if (d.Filename) {
+          var fn = String(d.Filename).replace(/^\.\//, '').replace(/^\//, '');
+          byFilename[fn] = d;
+        }
       }
     });
     return { byFilename: byFilename, byPackage: byPackage };
@@ -186,12 +187,14 @@
       var pkg = guessPackage(basename(f.path));
       var info = state.index.byFilename[f.path] || state.index.byPackage[pkg] || {};
       var ov = meta[pkg] || {};
-      var wantIcon = 'icons/' + pkg + '.png';
+      var realPkg = info.Package || pkg; // deb control 里的真实包标识符
+      var wantIcon = 'icons/' + realPkg + '.png';
       var localIcon = iconIndex[wantIcon.toLowerCase()] || null;
       var icon = ov.icon || (localIcon ? localIcon :
         (info.Icon && /^https?:/.test(info.Icon) ? info.Icon : 'CydiaIcon.png'));
       return {
         path: f.path, dir: dirname(f.path), sha: f.sha, size: f.size, pkg: pkg,
+        realPkg: realPkg,
         name: ov.name || info.Name || pkg,
         version: info.Version || '',
         desc: ov.description || info.Description || '',
@@ -201,39 +204,114 @@
         iconPath: localIcon
       };
     });
-
-    var dset = {};
-    state.files.forEach(function (f) {
-      var d = dirname(f.path);
-      if (d && d !== '.github') dset[d] = 1;
-    });
-    state.pending.forEach(function (p) {
-      if (p.op === 'add') { var d = dirname(p.path); if (d) dset[d] = 1; }
-      if (p.op === 'move') { var d2 = dirname(p.newPath); if (d2) dset[d2] = 1; }
-    });
-    state.dirs = Object.keys(dset).sort();
   }
 
-  function pluginsIn(dir) {
-    if (!dir) return state.plugins;
-    return state.plugins.filter(function (p) { return p.dir === dir; });
-  }
-  function dirCount(d) {
-    return state.plugins.filter(function (p) { return p.dir === d; }).length;
-  }
   function findPlugin(path) {
     return state.plugins.find(function (p) { return p.path === path; });
   }
 
+  // ---------- 分类（分组）模型 ----------
+  // 分类存在 repo-meta.json：categories=[...]，plugins[pkg].cats=[...]、plugins[pkg].section=...
+  // deb 文件位置不变，APT 索引通过 section 覆盖体现分类。
+  function pluginCats(p) {
+    var ov = (state.meta.plugins || {})[p.pkg] || {};
+    if (ov.cats && ov.cats.length) return ov.cats.slice();
+    return [ov.section || p.section || '未分类'];
+  }
+  function pluginsInCat(cat) {
+    return state.plugins.filter(function (p) { return pluginCats(p).indexOf(cat) >= 0; });
+  }
+  function categories() {
+    if (Array.isArray(state.meta.categories)) return state.meta.categories.slice();
+    var map = {};
+    state.plugins.forEach(function (p) {
+      pluginCats(p).forEach(function (c) { map[c] = 1; });
+    });
+    var names = Object.keys(map);
+    if (!names.length) names = ['未分类'];
+    names.sort(function (a, b) { return pluginsInCat(b).length - pluginsInCat(a).length; });
+    return names;
+  }
+  function setCategories(list) {
+    state.meta.categories = list;
+    state.metaDirty = true;
+    noteMetaOnly('更新分类目录');
+  }
+
+  // ---------- 物理目录树 ----------
+  function allDirs() {
+    var set = {};
+    function add(fp) {
+      var parts = String(fp).split('/');
+      parts.pop();
+      var cur = '';
+      parts.forEach(function (seg) {
+        cur = cur ? cur + '/' + seg : seg;
+        if (cur) set[cur] = 1;
+      });
+    }
+    state.files.forEach(function (f) { add(f.path); });
+    state.pending.forEach(function (p) {
+      if (p.op === 'add') add(p.path);
+      if (p.op === 'move') add(p.newPath);
+    });
+    return Object.keys(set).sort();
+  }
+  function childDirs(parent) {
+    var pref = parent ? parent + '/' : '';
+    var set = {};
+    allDirs().forEach(function (d) {
+      if (parent && d.indexOf(pref) !== 0) return;
+      var rest = parent ? d.slice(pref.length) : d;
+      if (!rest) return;
+      var seg = rest.split('/')[0];
+      if (seg) set[pref + seg] = 1;
+    });
+    return Object.keys(set).sort();
+  }
+  function filesInDir(dir) {
+    return state.files.filter(function (f) { return dirname(f.path) === dir; });
+  }
+  function debCountInTree(dir) {
+    var pref = dir ? dir + '/' : '';
+    return state.plugins.filter(function (p) {
+      return !dir || p.path.indexOf(pref) === 0;
+    }).length;
+  }
+
   // ---------- pending ----------
-  function addPending(p) { p.id = ++seq; state.pending.push(p); rebuild(); render(); }
+  function addPending(p) {
+    // 同一路径的重复新增直接替换（改图标「如有重复直接替换」）
+    if (p.op === 'add') {
+      state.pending = state.pending.filter(function (x) {
+        return !(x.op === 'add' && x.path === p.path);
+      });
+    }
+    p.id = ++seq;
+    state.pending.push(p);
+    rebuild(); render();
+  }
   function removePending(id) {
     state.pending = state.pending.filter(function (p) { return String(p.id) !== id; });
     rebuild(); render();
   }
-  function noteMeta(text) {
+  // 元数据变更只保留一条待提交记录
+  function noteMetaOnly(text) {
     state.metaDirty = true;
-    addPending({ op: 'meta', text: text });
+    var exist = state.pending.find(function (p) { return p.op === 'meta'; });
+    if (exist) {
+      exist.text = text;
+      render();
+    } else {
+      addPending({ op: 'meta', text: text });
+    }
+  }
+  function setMetaFor(pkg, cats, section) {
+    state.meta.plugins = state.meta.plugins || {};
+    var ov = state.meta.plugins[pkg] = state.meta.plugins[pkg] || {};
+    ov.cats = cats.slice();
+    if (section) ov.section = section;
+    noteMetaOnly('元数据：' + pkg + ' → ' + cats.join(' / '));
   }
 
   // ---------- session persistence (survives a page refresh) ----------
@@ -276,19 +354,22 @@
     $('view-plugins').hidden = v !== 'plugins';
     $('view-pending').hidden = v !== 'pending';
     $('view-me').hidden = v !== 'me';
-    $('nav-back').hidden = !(v === 'plugins' && (state.dirFilter || state.catFilter));
+
+    var canBack = (v === 'dirs' && !!state.navDir) || (v === 'plugins' && !!state.catFilter);
+    $('nav-back').hidden = !canBack;
     $('nav-add').hidden = (v === 'me' || v === 'pending');
 
-    var titles = { dirs: '目录', pending: '待提交', me: '连接' };
+    var titles = { dirs: state.navDir || '目录', pending: '待提交', me: '连接' };
     $('nav-title').textContent = v === 'plugins'
-      ? (state.dirFilter ||
-         (state.catFilter === '__all__' ? '全部插件' : (state.catFilter || '分类')))
+      ? (!state.catFilter ? '分类' :
+         (state.catFilter === '__all__' ? '全部插件' : state.catFilter))
       : titles[v];
     $('nav-add').textContent = '+';
 
     var searchable = (v === 'dirs' || v === 'plugins');
     $('search').parentNode.hidden = !searchable;
-    $('search').placeholder = v === 'dirs' ? '搜索目录' : '搜索插件';
+    $('search').placeholder = v === 'dirs' ? '搜索目录 / 插件'
+      : (state.catFilter ? '搜索插件' : '搜索分类');
 
     document.querySelectorAll('.tab').forEach(function (t) {
       t.classList.toggle('active', t.getAttribute('data-tab') === v);
@@ -304,93 +385,103 @@
     if (v === 'me') renderMe();
   }
 
+  function pluginCards(list) {
+    if (!list.length) return '';
+    var html = '<div class="list-card">';
+    list.forEach(function (p) {
+      html += '<div class="plugin">' +
+        '<img class="picon" src="' + esc(p.iconUrl) + '" alt="" loading="lazy" ' +
+        'onerror="this.onerror=null;this.src=\'' + esc(rawUrl('CydiaIcon.png')) + '\'">' +
+        '<div class="pinfo"><div class="pname">' + esc(p.name) + '</div>' +
+        '<div class="pmeta">' + esc(p.version || p.pkg) +
+        (p.section ? ' · ' + esc(p.section) : '') + ' · ' + fmtSize(p.size) + '</div>' +
+        (p.desc ? '<div class="pdesc">' + esc(p.desc) + '</div>' : '') + '</div>' +
+        '<button class="pmore" data-plugin="' + esc(p.path) + '" aria-label="插件选项">⋯</button></div>';
+    });
+    return html + '</div>';
+  }
+
   function renderDirs() {
     var q = $('search').value.trim().toLowerCase();
-    var total = state.plugins.length;
-    var html = '<div class="section-title">插件目录 · 共 ' + state.dirs.length + ' 个</div><div class="list-card">';
-    html += '<div class="cell" data-open="__all__"><div class="cell-main"><div class="cell-name">全部插件</div>' +
-      '<div class="cell-sub">查看仓库里所有 .deb</div></div>' +
-      '<span class="cell-count">' + total + '</span><span class="chev">›</span></div>';
-    state.dirs.filter(function (d) { return !q || d.toLowerCase().indexOf(q) >= 0; }).forEach(function (d) {
+    var cur = state.navDir;
+    var subs = childDirs(cur).filter(function (d) {
+      return !q || basename(d).toLowerCase().indexOf(q) >= 0;
+    });
+    var directDebs = state.plugins.filter(function (p) {
+      if (p.dir !== cur) return false;
+      return !q || (p.name + ' ' + p.pkg + ' ' + p.desc).toLowerCase().indexOf(q) >= 0;
+    });
+    var otherFiles = filesInDir(cur).filter(function (f) { return !/\.deb$/i.test(f.path); });
+
+    var html = '<div class="section-title">' + (cur || '仓库根目录') + ' · ' +
+      subs.length + ' 个目录</div>';
+    html += '<div class="list-card">';
+    subs.forEach(function (d) {
+      var childSubs = childDirs(d).length;
       html += '<div class="cell" data-open="' + esc(d) + '">' +
-        '<div class="cell-main"><div class="cell-name">' + esc(d) + '</div>' +
-        '<div class="cell-sub">' + dirCount(d) + ' 个插件 · ' +
-        state.files.filter(function (f) { return dirname(f.path) === d; }).length + ' 个文件</div></div>' +
-        '<span class="cell-count">' + dirCount(d) + '</span>' +
-        '<button class="cell-btn" data-dir="' + esc(d) + '" aria-label="目录选项">⋯</button>' +
+        '<div class="cell-main"><div class="cell-name">' + esc(basename(d)) + '</div>' +
+        '<div class="cell-sub">' + debCountInTree(d) + ' 个插件 · ' +
+        filesInDir(d).length + ' 个文件' + (childSubs ? ' · ' + childSubs + ' 个子目录' : '') + '</div></div>' +
+        '<span class="cell-count">' + debCountInTree(d) + '</span>' +
+        '<button class="cell-btn" data-dirmenu="' + esc(d) + '" aria-label="目录选项">⋯</button>' +
         '<span class="chev">›</span></div>';
     });
+    if (!subs.length) html += '<div class="empty">' + (q ? '没有匹配的目录' : '没有子目录') + '</div>';
     html += '</div>';
-    if (state.clipboard) {
-      html += '<div class="card"><b>剪贴板：' + esc(state.clipboard.plugin.name) +
-        '</b><p class="hint">' + (state.clipboard.mode === 'copy' ? '复制' : '剪切') +
-        ' · 进入目标目录后点右上角 + 或在插件页选「粘贴到此目录」</p></div>';
+
+    if (directDebs.length) {
+      html += '<div class="section-title">本目录插件 · ' + directDebs.length + ' 个</div>';
+      html += pluginCards(directDebs);
     }
-    html += '<div class="card"><b>提示</b><p class="hint">点目录行进入；点 ⋯ 可重命名、删除、上传或粘贴。' +
-      '只有 <code>debs/</code> 下的插件会出现在 APT 索引里。</p></div>';
+    if (otherFiles.length) {
+      html += '<div class="card"><b>其它文件</b><p class="hint">' + otherFiles.length +
+        ' 个（图标、索引、页面等）</p></div>';
+    }
+    if (!q && !cur) {
+      html += '<div class="card"><b>提示</b><p class="hint">点目录行进入子目录，可逐级浏览；' +
+        '点 ⋯ 可重命名、删除目录或在此上传插件。右上角 + 在当前目录下新建目录。</p></div>';
+    }
     $('view-dirs').innerHTML = html;
   }
 
-  function sectionStats() {
-    var map = {};
-    state.plugins.forEach(function (p) {
-      var s = p.section || '未分类';
-      map[s] = (map[s] || 0) + 1;
-    });
-    return map;
-  }
-
   function renderCats(q) {
-    var stats = sectionStats();
-    var names = Object.keys(stats).sort(function (a, b) {
-      if (a === '未分类') return 1;
-      if (b === '未分类') return -1;
-      return stats[b] - stats[a];
-    }).filter(function (s) { return !q || s.toLowerCase().indexOf(q) >= 0; });
-
-    var html = '<div class="section-title">分类 · ' + names.length + ' 个</div><div class="list-card">';
+    var names = categories().filter(function (c) {
+      return !q || c.toLowerCase().indexOf(q) >= 0;
+    });
+    var html = '<div class="section-title">分类目录 · ' + names.length + ' 个</div><div class="list-card">';
     html += '<div class="cell" data-cat="__all__"><div class="cell-main">' +
       '<div class="cell-name">全部插件</div>' +
       '<div class="cell-sub">所有分类 · 共 ' + state.plugins.length + ' 个</div></div>' +
       '<span class="cell-count">' + state.plugins.length + '</span><span class="chev">›</span></div>';
-    names.forEach(function (s) {
-      html += '<div class="cell" data-cat="' + esc(s) + '">' +
-        '<div class="cell-main"><div class="cell-name">' + esc(s) + '</div>' +
-        '<div class="cell-sub">' + stats[s] + ' 个插件</div></div>' +
-        '<span class="cell-count">' + stats[s] + '</span><span class="chev">›</span></div>';
+    names.forEach(function (c) {
+      var n = pluginsInCat(c).length;
+      html += '<div class="cell" data-cat="' + esc(c) + '">' +
+        '<div class="cell-main"><div class="cell-name">' + esc(c) + '</div>' +
+        '<div class="cell-sub">' + n + ' 个插件</div></div>' +
+        '<span class="cell-count">' + n + '</span>' +
+        '<button class="cell-btn" data-catmenu="' + esc(c) + '" aria-label="分类目录选项">⋯</button>' +
+        '<span class="chev">›</span></div>';
     });
     html += '</div>';
-    if (!names.length) html += '<div class="empty">' + (q ? '没有匹配的分类' : '还没有插件') + '</div>';
-    html += '<div class="card"><b>提示</b><p class="hint">分类来自源仓库 APT 索引的 Section 字段；' +
-      '点「全部插件」看所有插件，点分类看对应插件。</p></div>';
+    if (!names.length) html += '<div class="empty">' + (q ? '没有匹配的分类' : '还没有分类') + '</div>';
+    html += '<div class="card"><b>提示</b><p class="hint">右上角 + 添加目录；点分类行的 ⋯ 可重命名、删除目录。' +
+      '插件归类只记录归属，不会改动 deb 文件位置，越狱源不受影响。</p></div>';
     $('view-plugins').innerHTML = html;
   }
 
   function renderPlugins() {
     var q = $('search').value.trim().toLowerCase();
     if (!state.catFilter) return renderCats(q);
-    var base = state.dirFilter ? pluginsIn(state.dirFilter) : state.plugins;
-    var list = base.filter(function (p) {
-      if (state.catFilter !== '__all__' && (p.section || '未分类') !== state.catFilter) return false;
-      return !q || (p.name + ' ' + p.pkg + ' ' + p.desc).toLowerCase().indexOf(q) >= 0;
-    });
-    var html = '<div class="section-title">' + esc(state.catFilter === '__all__'
-      ? (state.dirFilter || '全部插件') : state.catFilter) + ' · ' + list.length + ' 个插件</div>';
+    var list = (state.catFilter === '__all__' ? state.plugins : pluginsInCat(state.catFilter))
+      .filter(function (p) {
+        return !q || (p.name + ' ' + p.pkg + ' ' + p.desc).toLowerCase().indexOf(q) >= 0;
+      });
+    var title = state.catFilter === '__all__' ? '全部插件' : state.catFilter;
+    var html = '<div class="section-title">' + esc(title) + ' · ' + list.length + ' 个插件</div>';
     if (!list.length) {
       html += '<div class="empty">这里还没有插件</div>';
     } else {
-      html += '<div class="list-card">';
-      list.forEach(function (p) {
-        html += '<div class="plugin">' +
-          '<img class="picon" src="' + esc(p.iconUrl) + '" alt="" loading="lazy" ' +
-          'onerror="this.onerror=null;this.src=\'' + esc(rawUrl('CydiaIcon.png')) + '\'">' +
-          '<div class="pinfo"><div class="pname">' + esc(p.name) + '</div>' +
-          '<div class="pmeta">' + esc(p.version || p.pkg) + (p.section ? ' · ' + esc(p.section) : '') +
-          ' · ' + fmtSize(p.size) + '</div>' +
-          (p.desc ? '<div class="pdesc">' + esc(p.desc) + '</div>' : '') + '</div>' +
-          '<button class="pmore" data-plugin="' + esc(p.path) + '" aria-label="插件选项">⋯</button></div>';
-      });
-      html += '</div>';
+      html += pluginCards(list);
     }
     $('view-plugins').innerHTML = html;
   }
@@ -399,7 +490,7 @@
     var label = { add: '新增', delete: '删除', move: '移动', meta: '元数据' };
     var cls = { add: 'add', delete: 'del', move: 'mov', meta: 'meta' };
     var html = '<div class="stat"><div><b>' + state.plugins.length + '</b><span>插件</span></div>' +
-      '<div><b>' + state.dirs.length + '</b><span>目录</span></div>' +
+      '<div><b>' + categories().length + '</b><span>分类</span></div>' +
       '<div><b>' + state.pending.length + '</b><span>待提交</span></div></div>';
     html += '<div class="section-title">待提交变更</div><div class="list-card">';
     if (!state.pending.length) {
@@ -410,7 +501,7 @@
         html += '<div class="change"><span class="tag ' + cls[p.op] + '">' + label[p.op] + '</span>' +
           '<span class="txt">' + esc(text) +
           (p.note ? '<small>' + esc(p.note) + '</small>' : '') + '</span>' +
-          '<button class="mini" data-undo="' + p.id + '">撤销</button></div>';
+          (p.op === 'meta' ? '' : '<button class="mini" data-undo="' + p.id + '">撤销</button>') + '</div>';
       });
     }
     html += '</div>';
@@ -452,10 +543,11 @@
       '<button id="btn-selftest" class="btn block" style="margin-top:10px">权限自检（查为什么提交失败）</button>' +
       '<div id="selftest-result"></div></div>' +
       '<div class="card"><b>使用说明</b><p class="hint">' +
-      '① 目录页点目录进入，点 ⋯ 管理目录；<br>' +
-      '② 插件页点 ⋯ 可改名、改图标、复制、剪切、移动、粘贴、删除；<br>' +
-      '③ 改名 / 改图标 / 上传等先进入「待提交」，确认后一次提交；<br>' +
-      '④ 单文件建议 ≤ 50 MB，移出 <code>debs/</code> 的插件不会被索引收录。</p></div>' +
+      '① 目录页逐级进入子目录，点 ⋯ 可重命名 / 删除目录、在此上传；<br>' +
+      '② 全部插件页是分类目录，右上角 + 添加目录，分类 ⋯ 可重命名 / 删除；<br>' +
+      '③ 分类内 + 上传的插件默认归到该分类；插件 ⋯ 可移动到… / 复制到… / 剪切到… 选分类；<br>' +
+      '④ 改图标自动存成 <code>icons/包标识符.png</code>，重名直接替换；<br>' +
+      '⑤ 单文件建议 ≤ 50 MB，移出 <code>debs/</code> 的插件不会被索引收录。</p></div>' +
       '<div class="card"><b>关于 Token</b><p class="hint">只保存在本机浏览器，随请求直发 api.github.com，' +
       '不写入仓库、不经过第三方。可随时「断开」清除。</p></div>';
     $('btn-refresh2').onclick = function () {
@@ -489,24 +581,85 @@
   }
   function closeDialog() { $('dialog').hidden = true; dialogCb = null; }
 
-  function pickDir(title, cb) {
-    var opts = state.dirs.slice();
-    if (state.dirFilter) opts = opts.filter(function (d) { return d !== state.dirFilter; });
-    var actions = opts.map(function (d) {
-      return { label: d + '/', icon: '▸', fn: function () { cb(d); } };
+  // 目标目录 = 全部插件页的分类列表
+  function pickCat(title, cb) {
+    var list = categories();
+    if (list.indexOf('未分类') < 0) list.push('未分类');
+    var actions = list.map(function (c) {
+      return { label: c + '/', icon: '▸', fn: function () { cb(c); } };
     });
-    actions.push({ label: '（仓库根目录）', icon: '▸', fn: function () { cb(''); } });
     actions.push({
       label: '新建目录…', icon: '+', fn: function () {
-        openDialog('新建目录', '', '输入新目录名', function (v) {
-          var d = cleanDir(v);
-          if (!validDir(d)) return toast('目录名不合法', true);
-          addPending({ op: 'add', path: d + '/.gitkeep', text: '\n', note: '新建目录' });
-          cb(d);
+        openDialog('新建分类目录', '', '输入目录名，然后直接选它', function (v) {
+          var name = String(v).trim();
+          if (!name) return toast('目录名不能为空', true);
+          var cs = categories();
+          if (cs.indexOf(name) < 0) { cs.push(name); setCategories(cs); }
+          cb(name);
         });
       }
     });
     openSheet(title, actions);
+  }
+
+  // ---------- 分类目录操作 ----------
+  function addCategory() {
+    openDialog('添加目录', '', '输入分类目录名（插件可归类到这个目录）', function (v) {
+      var name = String(v).trim();
+      if (!name) return toast('目录名不能为空', true);
+      var cs = categories();
+      if (cs.indexOf(name) >= 0) return toast('目录已存在', true);
+      cs.push(name);
+      setCategories(cs);
+      toast('已添加目录「' + name + '」');
+    });
+  }
+
+  function catMenu(cat) {
+    var actions = [
+      { label: '重命名目录', icon: '✎', fn: function () {
+        openDialog('重命名目录', cat, '该分类下 ' + pluginsInCat(cat).length +
+          ' 个插件会一起归到新名称', function (v) {
+          var nw = String(v).trim();
+          if (!nw || nw === cat) return toast('名称不合法或未变化', true);
+          var cs = categories();
+          if (cs.indexOf(nw) >= 0 && nw !== cat) return toast('目录已存在', true);
+          cs = cs.map(function (c) { return c === cat ? nw : c; });
+          state.meta.categories = cs;
+          state.plugins.forEach(function (p) {
+            var pc = pluginCats(p);
+            if (pc.indexOf(cat) < 0) return;
+            var nc = pc.map(function (c) { return c === cat ? nw : c; });
+            var ov = (state.meta.plugins || {})[p.pkg] || {};
+            setMetaFor(p.pkg, nc, (ov.section || p.section) === cat ? nw : ov.section);
+          });
+          noteMetaOnly('重命名目录：' + cat + ' → ' + nw);
+          if (state.catFilter === cat) state.catFilter = nw;
+          toast('已重命名，插件归类已更新');
+        });
+      } },
+      { label: '删除目录', icon: '✕', danger: true, fn: function () {
+        openDialog('删除目录', '', '将移除「' + cat + '」分组，组内 ' + pluginsInCat(cat).length +
+          ' 个插件归入「未分类」（不会删除 deb 文件）。输入目录名确认', function (v) {
+          if (String(v).trim() !== cat) return toast('输入的目录名不一致，已取消', true);
+          var cs = categories().filter(function (c) { return c !== cat; });
+          if (cs.indexOf('未分类') < 0) cs.push('未分类');
+          state.meta.categories = cs;
+          state.plugins.forEach(function (p) {
+            var pc = pluginCats(p);
+            if (pc.indexOf(cat) < 0) return;
+            var nc = pc.filter(function (c) { return c !== cat; });
+            if (!nc.length) nc = ['未分类'];
+            var ov = (state.meta.plugins || {})[p.pkg] || {};
+            setMetaFor(p.pkg, nc, (ov.section || p.section) === cat ? '未分类' : ov.section);
+          });
+          noteMetaOnly('删除目录：' + cat);
+          if (state.catFilter === cat) state.catFilter = null;
+          toast('目录已移除，插件归入未分类');
+        });
+      } }
+    ];
+    openSheet(cat + '/', actions);
   }
 
   // ---------- plugin actions ----------
@@ -521,24 +674,30 @@
           state.meta.plugins = state.meta.plugins || {};
           state.meta.plugins[p.pkg] = state.meta.plugins[p.pkg] || {};
           state.meta.plugins[p.pkg].name = v;
-          noteMeta(p.name + ' → ' + v + '（改名）');
+          noteMetaOnly('改名：' + p.name + ' → ' + v);
           toast('已加入待提交');
         });
       } },
       { label: '改图标', icon: '▣', fn: function () { changeIcon(p); } },
-      { label: '复制', icon: '⧉', fn: function () {
-        state.clipboard = { mode: 'copy', plugin: p };
-        render(); toast('已复制「' + p.name + '」');
-      } },
-      { label: '剪切', icon: '✂', fn: function () {
-        state.clipboard = { mode: 'cut', plugin: p };
-        render(); toast('已剪切「' + p.name + '」');
-      } },
       { label: '移动到…', icon: '⇢', fn: function () {
-        pickDir('移动到哪个目录', function (d) { movePlugin(p, d); });
+        pickCat('移动到哪个分类目录', function (cat) {
+          setMetaFor(p.pkg, [cat], cat);
+          toast('已归到「' + cat + '」，原分类不再显示');
+        });
       } },
-      { label: '粘贴到此目录', icon: '⎘', fn: function () {
-        pasteTo(state.dirFilter || 'debs');
+      { label: '复制到…', icon: '⧉', fn: function () {
+        pickCat('复制到哪个分类目录（保留原分类）', function (cat) {
+          var pc = pluginCats(p);
+          if (pc.indexOf(cat) >= 0) return toast('该插件已在此分类下', true);
+          setMetaFor(p.pkg, pc.concat([cat]), undefined);
+          toast('已同时归到「' + cat + '」');
+        });
+      } },
+      { label: '剪切到…', icon: '✂', fn: function () {
+        pickCat('剪切到哪个分类目录', function (cat) {
+          setMetaFor(p.pkg, [cat], cat);
+          toast('已剪切到「' + cat + '」');
+        });
       } },
       { label: '删除', icon: '✕', danger: true, fn: function () { deletePlugin(p); } }
     ];
@@ -552,13 +711,16 @@
       var f = e.target.files && e.target.files[0];
       if (!f) return;
       if (f.size > MAX_BYTES) return toast('图片过大', true);
+      // 图标统一命名：icons/包标识符.png（真实 deb control Package），重名直接替换
+      var iconPath = 'icons/' + (p.realPkg || p.pkg) + '.png';
       addPending({
-        op: 'add', path: 'icons/' + p.pkg + '.png', file: f,
-        size: f.size, note: '改图标 · ' + p.name
+        op: 'add', path: iconPath, file: f,
+        size: f.size, note: '改图标 · ' + p.name + ' → ' + iconPath
       });
-      p.iconUrl = URL.createObjectURL(f);
+      var cur = findPlugin(p.path);
+      if (cur) cur.iconUrl = URL.createObjectURL(f);
       render();
-      toast('新图标已加入待提交');
+      toast('新图标已加入待提交（' + iconPath + '）');
     };
     input.click();
   }
@@ -571,56 +733,34 @@
     toast('已加入待提交');
   }
 
-  function movePlugin(p, destDir) {
-    var dest = (destDir ? destDir + '/' : '') + basename(p.path);
-    if (dest === p.path) return toast('目标与原位置相同', true);
-    addPending({ op: 'move', path: p.path, newPath: dest, sha: p.sha, size: p.size, note: p.name });
-    toast('已加入待提交');
-  }
-
-  function pasteTo(destDir) {
-    var c = state.clipboard;
-    if (!c) return toast('剪贴板是空的', true);
-    var p = c.plugin;
-    var dest = (destDir ? destDir + '/' : '') + basename(p.path);
-    if (c.mode === 'cut') {
-      if (dest === p.path) return toast('目标与原位置相同', true);
-      addPending({ op: 'move', path: p.path, newPath: dest, sha: p.sha, size: p.size, note: '剪切粘贴' });
-    } else {
-      if (dest === p.path) return toast('不能粘贴到原位置', true);
-      addPending({ op: 'add', path: dest, sha: p.sha, size: p.size, note: '复制自 ' + p.name });
-    }
-    state.clipboard = null;
-    render();
-    toast('已粘贴到 ' + (destDir || '根目录'));
-  }
-
   // ---------- directory actions ----------
   function dirMenu(d) {
     var actions = [
       { label: '重命名目录', icon: '✎', fn: function () {
-        openDialog('重命名目录', d, '该目录下全部文件会一起移动', function (v) {
+        openDialog('重命名目录', basename(d), '该目录下全部文件（含子目录）会一起移动', function (v) {
           var nd = cleanDir(v);
-          if (!validDir(nd) || nd === d) return toast('目录名不合法或未变化', true);
+          if (!validDir(nd) || nd === basename(d)) return toast('目录名不合法或未变化', true);
+          var parent = dirname(d);
+          var target = (parent ? parent + '/' : '') + nd;
+          if (target === d) return toast('目录名未变化', true);
           var affected = state.files.filter(function (f) { return f.path.indexOf(d + '/') === 0; });
           if (!affected.length) return toast('该目录下没有文件', true);
           affected.forEach(function (f) {
             addPending({
-              op: 'move', path: f.path, newPath: nd + f.path.slice(d.length),
+              op: 'move', path: f.path, newPath: target + f.path.slice(d.length),
               sha: f.sha, size: f.size, note: '目录重命名'
             });
           });
           toast('已加入 ' + affected.length + ' 个移动');
         });
       } },
-      { label: '在此上传插件', icon: '↑', fn: function () { uploadTo(d); } },
-      { label: '粘贴插件到此', icon: '⎘', fn: function () { pasteTo(d); } },
+      { label: '在此上传插件', icon: '↑', fn: function () { uploadTo(d, null); } },
       { label: '删除目录', icon: '✕', danger: true, fn: function () {
         var affected = state.files.filter(function (f) { return f.path.indexOf(d + '/') === 0; });
         if (!affected.length) return toast('该目录下没有文件', true);
         openDialog('删除目录', '', '将删除 ' + d + '/ 下 ' + affected.length +
           ' 个文件，输入目录名确认', function (v) {
-          if (String(v).trim() !== d) return toast('输入的目录名不一致，已取消', true);
+          if (String(v).trim() !== basename(d)) return toast('输入的目录名不一致，已取消', true);
           affected.forEach(function (f) {
             addPending({ op: 'delete', path: f.path, size: f.size, note: '删除目录' });
           });
@@ -631,23 +771,28 @@
     openSheet(d + '/', actions);
   }
 
-  function uploadTo(dir) {
+  function uploadTo(dir, cat) {
     var input = $('file-deb');
     input.value = '';
     input.onchange = function (e) {
       var files = Array.prototype.slice.call(e.target.files || []);
       if (!files.length) return;
-      var skipped = 0;
+      var skipped = 0, added = 0;
       files.forEach(function (f) {
         if (f.size > MAX_BYTES) { skipped++; return; }
         var name = String(f.name || 'file').replace(/[\\/]/g, '_');
         addPending({
           op: 'add', path: (dir ? dir + '/' : '') + name, file: f,
-          size: f.size, note: '上传插件'
+          size: f.size, note: '上传插件' + (cat ? ' · 归入 ' + cat : '')
         });
+        if (cat) {
+          // 上传后默认归到当前分类目录（deb 仍在 debs/ 下，索引不受影响）
+          setMetaFor(guessPackage(name), [cat], cat);
+        }
+        added++;
       });
       if (skipped) toast(skipped + ' 个文件超过 50 MB 已跳过', true);
-      else toast('已加入 ' + files.length + ' 个插件');
+      else toast('已加入 ' + added + ' 个插件' + (cat ? '（归入 ' + cat + '）' : ''));
     };
     input.click();
   }
@@ -743,8 +888,8 @@
       });
 
       state.pending = [];
-      state.clipboard = null;
       state.commitError = '';
+      state.metaDirty = false;
       await loadAll();
       render();
       toast('提交成功，索引与站点正在自动更新');
@@ -776,7 +921,7 @@
       $('main').hidden = false;
       setMsg('login-msg', '');
       state.view = 'dirs';
-      state.dirFilter = null;
+      state.navDir = '';
       state.catFilter = null;
       await loadAll();
       render();
@@ -792,7 +937,6 @@
     sessionStorage.removeItem('jbrm_token');
     token = '';
     // 保留待提交改动与未提交的元数据，方便换 Token 后继续提交
-    state.clipboard = null;
     $('main').hidden = true;
     $('login').hidden = false;
     $('token').value = '';
@@ -808,7 +952,8 @@
   document.querySelectorAll('.tab').forEach(function (t) {
     t.onclick = function () {
       state.view = t.getAttribute('data-tab');
-      if (state.view === 'plugins') { state.dirFilter = null; state.catFilter = null; }
+      state.navDir = '';
+      state.catFilter = null;
       $('search').value = '';
       render();
       window.scrollTo(0, 0);
@@ -816,56 +961,59 @@
   });
 
   $('nav-back').onclick = function () {
-    if (state.dirFilter) {
-      state.dirFilter = null; state.catFilter = null; state.view = 'dirs';
-    } else if (state.catFilter) {
-      state.catFilter = null; // 回到分类列表
-    } else {
-      state.view = 'dirs';
+    if (state.view === 'dirs') {
+      state.navDir = dirname(state.navDir);
+    } else if (state.view === 'plugins') {
+      state.catFilter = null; // 回到分类目录列表
     }
     $('search').value = ''; render();
   };
+
   $('nav-add').onclick = function () {
     if (state.view === 'pending') {
       state.pending = []; rebuild(); render(); toast('已清空');
     } else if (state.view === 'dirs') {
-      openDialog('新建目录', '', '输入目录名（可在其中放插件）', function (v) {
+      openDialog('添加目录', '', state.navDir
+        ? '在 ' + state.navDir + '/ 下新建目录' : '在仓库根目录下新建目录', function (v) {
         var d = cleanDir(v);
         if (!validDir(d)) return toast('目录名不合法', true);
-        if (state.dirs.indexOf(d) >= 0) return toast('目录已存在', true);
-        addPending({ op: 'add', path: d + '/.gitkeep', text: '\n', note: '新建目录' });
+        var full = (state.navDir ? state.navDir + '/' : '') + d;
+        if (allDirs().indexOf(full) >= 0) return toast('目录已存在', true);
+        addPending({ op: 'add', path: full + '/.gitkeep', text: '\n', note: '新建目录' });
         toast('目录已加入待提交');
       });
     } else if (state.view === 'plugins') {
-      uploadTo(state.dirFilter || 'debs');
+      if (!state.catFilter) return addCategory(); // 分类列表页：添加目录
+      if (state.catFilter === '__all__') return uploadTo('debs', '未分类');
+      uploadTo('debs', state.catFilter);          // 分类内：上传插件并归入该分类
     }
   };
 
   $('view-dirs').onclick = function (e) {
-    var dirBtn = e.target.getAttribute('data-dir');
-    if (dirBtn) { e.stopPropagation(); return dirMenu(dirBtn); }
+    var menu = e.target.closest('[data-dirmenu]');
+    if (menu) { e.stopPropagation(); return dirMenu(menu.getAttribute('data-dirmenu')); }
+    var plugin = e.target.closest('[data-plugin]');
+    if (plugin) return pluginMenu(plugin.getAttribute('data-plugin'));
     var cell = e.target.closest('[data-open]');
     if (!cell) return;
-    var v = cell.getAttribute('data-open');
-    state.dirFilter = v === '__all__' ? null : v;
-    state.view = 'plugins';
+    state.navDir = cell.getAttribute('data-open');
     $('search').value = '';
     render();
     window.scrollTo(0, 0);
   };
 
   $('view-plugins').onclick = function (e) {
+    var menu = e.target.closest('[data-catmenu]');
+    if (menu) { e.stopPropagation(); return catMenu(menu.getAttribute('data-catmenu')); }
+    var plugin = e.target.closest('[data-plugin]');
+    if (plugin) return pluginMenu(plugin.getAttribute('data-plugin'));
     var catCell = e.target.closest('[data-cat]');
     if (catCell) {
       state.catFilter = catCell.getAttribute('data-cat');
-      state.dirFilter = null;
       $('search').value = '';
       render();
       window.scrollTo(0, 0);
-      return;
     }
-    var path = e.target.getAttribute('data-plugin');
-    if (path) pluginMenu(path);
   };
 
   $('view-pending').onclick = function (e) {
