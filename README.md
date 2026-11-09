@@ -1,4 +1,4 @@
-# 与你有源 · 管理台
+# 于你有源 · 管理台
 
 管理 [ynyy0/ynyy0.github.io](https://github.com/ynyy0/ynyy0.github.io) 的手机端控制台（纯静态，无后端），界面参照 Sileo 的「分类 / 软件包」列表。
 
