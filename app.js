@@ -6,6 +6,7 @@
   var REPO = 'ynyy0.github.io';
   var BRANCH = 'main';
   var MAX_BYTES = 50 * 1024 * 1024;
+  var SOURCE_ICON = 'https://ynyy0.github.io/CydiaIcon.png';
 
   var $ = function (id) { return document.getElementById(id); };
   var token = '';
@@ -19,7 +20,7 @@
     iconPreviews: {},    // lowercase path -> 本地预览 blob URL（未提交）
     index: { byFilename: {}, byPackage: {} },
     meta: { plugins: {} },                       // 仓库基线（loadAll 总是刷新）
-    edits: { plugins: {}, categories: null },    // 本地未提交的改动
+    edits: { plugins: {}, categories: null, useSourceIcon: null }, // 本地未提交的改动
     _eff: null,                                  // 合并后的视图缓存
     plugins: [],
     pending: [],
@@ -42,6 +43,16 @@
     return (n / 1048576).toFixed(1) + ' MB';
   }
   function basename(p) { return p.slice(p.lastIndexOf('/') + 1); }
+  function fileKind(p) {
+    var n = basename(p);
+    if (/^Packages(\.|$)/.test(n)) return 'APT 索引';
+    if (n === 'Release') return 'Release';
+    if (n === '.nojekyll') return 'Pages 配置';
+    if (/\.html$/i.test(n)) return '网页';
+    if (/\.md$/i.test(n)) return '说明文档';
+    if (/\.json$/i.test(n)) return '配置';
+    return '文件';
+  }
   function dirname(p) { var i = p.lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i); }
   function cleanDir(s) { return String(s || '').trim().replace(/^\/+|\/+$/g, ''); }
   function validDir(s) { return !!s && !/[\\]/.test(s) && s.indexOf('..') < 0; }
@@ -151,13 +162,24 @@
     });
     if (edits && edits.categories != null) out.categories = edits.categories.slice();
     else if (base && base.categories) out.categories = base.categories.slice();
+    if (edits && edits.useSourceIcon !== null && edits.useSourceIcon !== undefined) {
+      out.useSourceIcon = !!edits.useSourceIcon;
+    } else if (base && base.useSourceIcon !== undefined) {
+      out.useSourceIcon = !!base.useSourceIcon;
+    }
     return out;
   }
   function effMeta() { return state._eff || mergeMeta(state.meta, state.edits); }
   function hasEdits() {
-    return Object.keys(state.edits.plugins || {}).length > 0 || state.edits.categories !== null;
+    return Object.keys(state.edits.plugins || {}).length > 0 ||
+      state.edits.categories !== null || state.edits.useSourceIcon !== null;
   }
-  function emptyEdits() { return { plugins: {}, categories: null }; }
+  function emptyEdits() { return { plugins: {}, categories: null, useSourceIcon: null }; }
+  function sourceIconUrl() {
+    // 用仓库里 CydiaIcon.png 的 blob sha 做版本号，换源图标后浏览器不会拿旧缓存
+    var f = state.files.find(function (x) { return x.path === 'CydiaIcon.png'; });
+    return SOURCE_ICON + '?v=' + ((f && f.sha ? f.sha : '0').slice(0, 8));
+  }
 
   async function loadRepoMeta() {
     var metaFile = state.files.find(function (f) { return f.path === 'repo-meta.json'; });
@@ -215,6 +237,7 @@
   function rebuild() {
     state._eff = mergeMeta(state.meta, state.edits);
     var meta = state._eff.plugins || {};
+    var useSource = !!state._eff.useSourceIcon;
     var iconIndex = state.iconIndex;
     var previews = state.iconPreviews;
     state.plugins = state.files.filter(function (f) {
@@ -231,7 +254,10 @@
         (info.Icon && /^https?:/.test(info.Icon) ? info.Icon : 'CydiaIcon.png'));
       var fallbackIcon = info.Icon && /^https?:/.test(info.Icon) ? info.Icon : 'CydiaIcon.png';
       var url;
-      if (localIcon && previews[localIcon.toLowerCase()]) {
+      if (useSource || icon === SOURCE_ICON) {
+        // 全局设置或单个插件「使用源图标」
+        url = sourceIconUrl();
+      } else if (localIcon && previews[localIcon.toLowerCase()]) {
         url = previews[localIcon.toLowerCase()];
       } else if (/^https?:/.test(icon)) {
         url = icon;
@@ -379,7 +405,8 @@
       if (s.edits) {
         state.edits = {
           plugins: s.edits.plugins || {},
-          categories: s.edits.categories != null ? s.edits.categories : null
+          categories: s.edits.categories != null ? s.edits.categories : null,
+          useSourceIcon: s.edits.useSourceIcon != null ? !!s.edits.useSourceIcon : null
         };
       }
       state.commitError = s.commitError || '';
@@ -480,7 +507,9 @@
       return !q || (p.name + ' ' + p.pkg + ' ' + p.desc).toLowerCase().indexOf(q) >= 0;
     });
     var otherFiles = filesInDir(cur).filter(function (f) { return !/\.deb$/i.test(f.path); });
-    var images = otherFiles.filter(function (f) { return /\.(png|jpe?g|webp|gif)$/i.test(f.path); });
+    var imageRe = /\.(png|jpe?g|webp|gif)$/i;
+    var images = otherFiles.filter(function (f) { return imageRe.test(f.path); });
+    var plainFiles = otherFiles.filter(function (f) { return !imageRe.test(f.path); });
 
     var html = '<div class="section-title">' + (cur || '仓库根目录') + ' · ' +
       subs.length + ' 个目录</div>';
@@ -513,9 +542,19 @@
       html += '<div class="section-title">本目录插件 · ' + directDebs.length + ' 个</div>';
       html += pluginCards(directDebs);
     }
-    var rest = otherFiles.length - images.length;
-    if (rest > 0) {
-      html += '<div class="card"><b>其它文件</b><p class="hint">' + rest + ' 个（索引、页面等）</p></div>';
+    if (plainFiles.length) {
+      html += '<div class="section-title">索引与其它文件 · ' + plainFiles.length +
+        ' 个（点击查看，⋯ 可删除）</div><div class="list-card">';
+      plainFiles.filter(function (f) {
+        return !q || basename(f.path).toLowerCase().indexOf(q) >= 0;
+      }).forEach(function (f) {
+        html += '<div class="cell" data-file="' + esc(f.path) + '">' +
+          '<div class="cell-main"><div class="cell-name">' + esc(basename(f.path)) + '</div>' +
+          '<div class="cell-sub">' + esc(fileKind(f.path)) + ' · ' + fmtSize(f.size) + '</div></div>' +
+          '<button class="cell-btn" data-filemenu="' + esc(f.path) + '" aria-label="文件选项">⋯</button>' +
+          '<span class="chev">›</span></div>';
+      });
+      html += '</div>';
     }
     if (!q && !cur) {
       html += '<div class="card"><b>提示</b><p class="hint">点目录行进入子目录；' +
@@ -642,14 +681,27 @@
       '<button id="btn-selftest" class="btn block" style="margin-top:10px">权限自检（查为什么提交失败）</button>' +
       '<button id="btn-clearcache" class="btn block" style="margin-top:10px">清除本地缓存</button>' +
       '<div id="selftest-result"></div></div>' +
+      '<div class="card"><b>显示设置</b><p class="hint">' +
+      '开启「使用源图标」后，全部插件统一显示源图标 <code>CydiaIcon.png</code>，' +
+      '源索引里的 Icon 也会一起替换；关闭后恢复各自图标。没有专属图标的插件本来就会显示源图标。' +
+      '改动需提交后才生效。</p>' +
+      '<button id="btn-sourceicon" class="btn block ' +
+      (effMeta().useSourceIcon ? 'primary' : '') + '" style="margin-top:12px">使用源图标：' +
+      (effMeta().useSourceIcon ? '已开启（点此关闭）' : '已关闭（点此开启）') + '</button></div>' +
       '<div class="card"><b>使用说明</b><p class="hint">' +
-      '① 目录页逐级进入子目录，进入 icons/ 可查看图标库；<br>' +
+      '① 目录页逐级进入子目录，索引 / Release / 页面等文件全部列出，点文件可查看，⋯ 可删除；<br>' +
       '② 全部插件页是分类目录，+ 添加目录，分类 ⋯ 可重命名 / 删除；<br>' +
-      '③ 插件 ⋯ 可改名、改图标、移动到… / 剪切到…（选分类或仓库目录）、删除；<br>' +
-      '④ 所有改动先进入「待提交」，只有提交后才真正生效；<br>' +
+      '③ 插件 ⋯ 可改名、改图标、使用源图标、移动到…（选分类或仓库目录）、删除；<br>' +
+      '④ 所有改动先进入「待提交」，提交后还需 2-5 分钟部署才会在源里生效；<br>' +
       '⑤ 改图标存成 <code>icons/包标识符.png</code>，图标链接自带版本号，换图后客户端不会再用旧缓存。</p></div>' +
       '<div class="card"><b>关于 Token</b><p class="hint">只保存在本机浏览器，直发 api.github.com，' +
       '不写入仓库、不经过第三方。可随时「断开」清除。</p></div>';
+    $('btn-sourceicon').onclick = function () {
+      var cur = !!effMeta().useSourceIcon;
+      state.edits.useSourceIcon = !cur;
+      noteMetaOnly('设置：使用源图标 ' + (!cur ? '开' : '关'));
+      toast('已' + (!cur ? '开启' : '关闭') + '「使用源图标」，请点提交');
+    };
     $('btn-refresh2').onclick = function () {
       loadAll().then(function () { toast('已重新读取仓库最新状态'); })
         .catch(function (e) { toast('刷新失败：' + e.message, true); });
@@ -815,11 +867,20 @@
         });
       } },
       { label: '改图标', icon: '▣', fn: function () { changeIcon(p); } },
+      (function () {
+        var using = (effMeta().plugins[p.realPkg] || {}).icon === SOURCE_ICON;
+        return {
+          label: using ? '恢复插件图标' : '使用源图标', icon: using ? '↺' : '◉',
+          fn: function () {
+            var e = state.edits.plugins[p.realPkg] = state.edits.plugins[p.realPkg] || {};
+            e.icon = using ? null : SOURCE_ICON;
+            noteMetaOnly((using ? '恢复图标：' : '使用源图标：') + p.name);
+            toast('已加入待提交，请点提交');
+          }
+        };
+      })(),
       { label: '移动到…', icon: '⇢', fn: function () {
-        pickTarget('移动到…', function (t) { applyMove(p, t, false); });
-      } },
-      { label: '剪切到…', icon: '✂', fn: function () {
-        pickTarget('剪切到…', function (t) { applyMove(p, t, true); });
+        pickTarget('移动到…', function (t) { applyMove(p, t); });
       } },
       { label: '删除', icon: '✕', danger: true, fn: function () {
         var extra = p.iconPath ? '，同时会把 ' + p.iconPath + ' 一起加入待删除（可单独撤销）' : '';
@@ -831,10 +892,10 @@
     openSheet(p.name, actions);
   }
 
-  function applyMove(p, target, isCut) {
+  function applyMove(p, target) {
     if (target.type === 'cat') {
       setMetaFor(p.realPkg, [target.value], target.value);
-      toast((isCut ? '已剪切' : '已移动') + '到「' + target.value + '」，请点提交');
+      toast('已移动到「' + target.value + '」，请点提交');
       return;
     }
     var dest = (target.value ? target.value + '/' : '') + basename(p.path);
@@ -855,6 +916,12 @@
       if (!f) return;
       if (f.size > MAX_BYTES) return toast('图片过大', true);
       var iconPath = 'icons/' + p.realPkg + '.png';
+      // 之前若设过「使用源图标」，上传新图时取消该覆盖，让新图标生效
+      if ((effMeta().plugins[p.realPkg] || {}).icon) {
+        var e = state.edits.plugins[p.realPkg] = state.edits.plugins[p.realPkg] || {};
+        e.icon = null;
+        noteMetaOnly('上传新图标：' + p.name);
+      }
       addPending({
         op: 'add', path: iconPath, file: f,
         size: f.size, note: '改图标 · ' + p.name + ' → ' + iconPath
@@ -878,6 +945,17 @@
   }
 
   // ---------- directory actions ----------
+  function fileMenu(path) {
+    var f = state.files.find(function (x) { return x.path === path; });
+    confirmSheet('删除文件',
+      '将删除 ' + path + (f ? '（' + fmtSize(f.size) + '）' : '') +
+      '。此操作不可逆，需提交后才真正生效；删除 Packages / Release 等索引文件会让源暂时不可用。',
+      '继续删除', function () {
+        addPending({ op: 'delete', path: path, size: f ? f.size : 0, note: '删除文件' });
+        toast('已加入待提交，请点提交');
+      });
+  }
+
   function dirMenu(d) {
     var actions = [
       { label: '重命名目录', icon: '✎', fn: function () {
@@ -1153,8 +1231,15 @@
     }
     var menu = e.target.closest('[data-dirmenu]');
     if (menu) { e.stopPropagation(); return dirMenu(menu.getAttribute('data-dirmenu')); }
+    var fmenu = e.target.closest('[data-filemenu]');
+    if (fmenu) { e.stopPropagation(); return fileMenu(fmenu.getAttribute('data-filemenu')); }
     var plugin = e.target.closest('[data-plugin]');
     if (plugin) return pluginMenu(plugin.getAttribute('data-plugin'));
+    var fileCell = e.target.closest('[data-file]');
+    if (fileCell) {
+      window.open(rawUrl(fileCell.getAttribute('data-file')) + '?t=' + Date.now(), '_blank', 'noopener');
+      return;
+    }
     var cell = e.target.closest('[data-open]');
     if (!cell) return;
     state.navDir = cell.getAttribute('data-open');
